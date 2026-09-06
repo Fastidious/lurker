@@ -377,6 +377,7 @@ export class EngineUpstream extends EventEmitter {
         this.capsAtBurstEnd = new Set(this.caps);
         this.nickAtBurstEnd = this.nick;
         this.registeredUnattended = this.sink === null;
+        this.emit('registered');
       }
     }
     const seq = this.buffer.push(line);

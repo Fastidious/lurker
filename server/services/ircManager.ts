@@ -144,7 +144,10 @@ function engineHolds(userId: number, networkId: number): boolean {
 
 class IrcManager extends EventEmitter {
   byUser: Map<number, Map<number, IrcConnection>>;
-  private engineReconcileHooked = false;
+  // The link whose 'ready' and 'held' events reconcile listens on — held so a
+  // link replaced under us (tests rebuild the singleton) is hooked afresh
+  // rather than left to the listeners on its predecessor.
+  private reconcileHookedLink: EngineLink | null = null;
 
   constructor() {
     super();
@@ -205,11 +208,15 @@ class IrcManager extends EventEmitter {
     for (const id of userIds) this.initForUser(id);
     if (engineConfigured()) {
       this.reconcileEngine();
-      // Again whenever the link (re)connects: an engine that answered after the
-      // boot-time wait, or came back from an outage, reports a fresh held list.
-      if (!this.engineReconcileHooked) {
-        this.engineReconcileHooked = true;
-        EngineLink.shared().on('ready', () => this.reconcileEngine());
+      // Again whenever the link (re)connects — an engine that answered after
+      // the boot-time wait, or came back from an outage, reports a fresh held
+      // list — and whenever the engine offers a session after that: one whose
+      // previous link was still on the books at hello and has since let go.
+      const link = EngineLink.shared();
+      if (this.reconcileHookedLink !== link) {
+        this.reconcileHookedLink = link;
+        link.on('ready', () => this.reconcileEngine());
+        link.on('held', () => this.reconcileEngine());
       }
     }
   }

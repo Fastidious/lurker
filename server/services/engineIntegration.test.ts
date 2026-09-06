@@ -389,6 +389,82 @@ describe('IrcConnection through the engine', () => {
     await until(() => fresh.state === 'connected', 5000, 'fresh connection for the next test');
   }, 30000);
 
+  // #894: the hello lists what no other link claims, and a link the engine has
+  // not yet seen die still claims what it held. Nothing re-listed those — a
+  // session left that way sat unadopted, or for a paused account un-closed,
+  // until the orphan reaper. The engine now offers it the moment the old link
+  // is gone. The corpse here is a bare link that attached and then died
+  // without a word, which is what a crashed process looks like to the engine.
+  it('a session released after hello is adopted, or closed, without a restart (#894)', async () => {
+    const conn = ircManager.getConnection(userId, network.id)!;
+    expect(conn.state).toBe('connected');
+    const corpse = async (): Promise<TestLink> => {
+      const c = await TestLink.connect(EngineLink.shared().opts.port, SECRET, {
+        instance: instanceId(),
+      });
+      c.send({
+        op: 'connect',
+        id: engineId,
+        host: '127.0.0.1',
+        port: ircd.port,
+        tls: false,
+        rejectUnauthorized: false,
+      });
+      await c.waitFor((f) => f.op === 'attached' && f.id === engineId);
+      return c;
+    };
+    ircManager.shutdown();
+    await until(() => engine.held().includes(engineId), 5000, 'engine holds the detached socket');
+    let c = await corpse();
+    EngineLink.resetForTests();
+    EngineLink.shared().start();
+    await until(() => EngineLink.shared().state === 'ready', 5000, 'new link ready');
+    // Strict at hello, as before.
+    expect(EngineLink.shared().held).not.toContain(engineId);
+    const rowsBefore = rows().length;
+    const registrations = ircd.registrations.filter((r) => r.nick === 'lurk').length;
+    ircManager.initAll();
+    expect(ircManager.getConnection(userId, network.id)).toBeNull();
+    c.kill();
+    await until(
+      () => ircManager.getConnection(userId, network.id)?.state === 'connected',
+      5000,
+      'adopted once the corpse was gone',
+    );
+    // An attach, not a dial: no "Connecting…", no second registration.
+    expect(
+      rows()
+        .slice(rowsBefore)
+        .some((r) => (r.text ?? '').startsWith('Connecting to ')),
+    ).toBe(false);
+    expect(ircd.registrations.filter((r) => r.nick === 'lurk')).toHaveLength(registrations);
+
+    // Same again, paused: the offer ends in a close.
+    ircManager.shutdown();
+    await until(() => engine.held().includes(engineId), 5000, 'engine holds it again');
+    c = await corpse();
+    setUserPaused(userId, true);
+    try {
+      EngineLink.resetForTests();
+      EngineLink.shared().start();
+      await until(() => EngineLink.shared().state === 'ready', 5000, 'link ready again');
+      ircManager.initAll();
+      expect(ircManager.getConnection(userId, network.id)).toBeNull();
+      c.kill();
+      await until(
+        () => !engine.held().includes(engineId),
+        5000,
+        "engine closed the paused account's socket",
+      );
+      await until(() => ircd.client('lurk') === undefined, 5000, 'ircd saw it go');
+    } finally {
+      setUserPaused(userId, false);
+    }
+    // Leave a live connection behind for the next test.
+    const fresh = ircManager.startNetwork(userId, network.id)!;
+    await until(() => fresh.state === 'connected', 5000, 'fresh connection for the next test');
+  }, 30000);
+
   it('a buffer closed while the link was down is PARTed on re-attach, not re-armed', async () => {
     const conn = ircManager.getConnection(userId, network.id)!;
     expect(conn.state).toBe('connected');

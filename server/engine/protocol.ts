@@ -26,7 +26,13 @@ export const PROTOCOL_MAJOR = 1;
 // the name it had at the rename — silently, and for the life of the socket —
 // which is why the app half of draft/channel-rename (#858) has a minor to gate
 // on rather than having to assume.
-export const PROTOCOL_MINOR = 3;
+// minor 4 (#894): `held` — a session offered AFTER hello. The hello's list
+// withholds what another link still claims, a dead link's included, and until
+// this minor nothing ever re-listed those: a session released after the hello
+// stayed unadopted (or, for a paused account, un-closed) until the orphan
+// reaper or the next restart. An engine below this still lists correctly at
+// hello; it just never says anything afterwards.
+export const PROTOCOL_MINOR = 4;
 
 // One frame is one JSON object on one line. Most wrap a single IRC line (≤ 8191
 // bytes with tags); the one large frame is `attached`, whose replay is bounded by
@@ -87,7 +93,9 @@ export type AppToEngine =
       app: { version: string; startedAt?: number };
     }
   // Link liveness, both directions: the engine answers `pong`; the app sends
-  // `ping` on a timer and drops a link that answers nothing for a while.
+  // `ping` on a timer and drops a link that answers nothing for a while. The
+  // engine pings too, as the fence in front of a `held` offer (below): the app
+  // answers every ping with one pong, in order.
   | { op: 'ping' }
   | { op: 'pong' }
   // Connect-or-attach. The app never has to know which one it is getting: the
@@ -166,6 +174,14 @@ export type EngineToApp =
   | { op: 'detached'; id: string; reason: 'taken-over' }
   // The IRC socket is gone. The engine forgets the id.
   | { op: 'closed'; id: string; error?: string }
+  // A session this instance may attach to that the hello could not list: the
+  // link holding it has since died, or detached it (or it finished registering
+  // with nobody attached). The engine sends this only after a ping/pong round
+  // trip with the receiving link, so a `close` that link had already sent for
+  // the id has been applied by the time the offer arrives — an offer never
+  // contradicts something the app already asked for. The app treats it as one
+  // more entry in hello.held: adopt if policy allows, close if not.
+  | { op: 'held'; id: string }
   | { op: 'listing'; connections: ConnectionInfo[] }
   | { op: 'error'; id?: string; message: string };
 

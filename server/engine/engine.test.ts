@@ -1195,6 +1195,124 @@ describe('third review round', () => {
   });
 });
 
+// The hello's `held` list withholds what another link still claims — a dead
+// link's included, since the engine may read a replacement's hello before the
+// corpse's EOF (#849) — and until #894 nothing ever re-listed those. TestLink
+// answers nothing on its own, so the pong that lets an offer through is the
+// test's to send, which is what makes the fence observable.
+describe('a session released after hello is offered (#894)', () => {
+  it('offers the session a dead link still claimed at hello, once that link is gone', async () => {
+    const id = `late:${++counter}`;
+    const nick = `late${counter}`;
+    const a = await link();
+    await register(a, id, nick);
+    const b = await link();
+    // Strict at hello, as before: a is still on the books.
+    expect(b.hello?.held).not.toContain(id);
+    a.kill();
+    // The engine asks before it tells: nothing is offered ahead of the pong.
+    await b.waitFor((f) => f.op === 'ping');
+    await new Promise((r) => setTimeout(r, 30));
+    expect(b.frames.some((f) => f.op === 'held')).toBe(false);
+    b.send({ op: 'pong' });
+    expect(await b.waitFor((f) => f.op === 'held')).toMatchObject({ op: 'held', id });
+    // And it is adoptable: the connect attaches, it does not dial.
+    b.send(connectFrame(id));
+    const att = await b.waitFor<Attached>((f) => f.op === 'attached' && f.id === id);
+    expect(att.nick).toBe(nick);
+    expect(ircd.registrations.filter((r) => r.nick === nick)).toHaveLength(1);
+  });
+
+  it('offers what a link let go of to the others, not back to it', async () => {
+    const id = `letgo:${++counter}`;
+    const a = await link();
+    await register(a, id, `letgo${counter}`);
+    const b = await link();
+    expect(b.hello?.held).not.toContain(id);
+    a.send({ op: 'detach', id });
+    await b.waitFor((f) => f.op === 'ping');
+    b.send({ op: 'pong' });
+    expect(await b.waitFor((f) => f.op === 'held')).toMatchObject({ id });
+    expect(a.frames.some((f) => f.op === 'ping' || f.op === 'held')).toBe(false);
+  });
+
+  it('a close the link had already sent wins: the offer is fenced behind a ping', async () => {
+    // #849's shape with the offer in it. A Disconnect issued during a link
+    // blip is flushed as a `close` the moment the replacement link is up, and
+    // that close and the dead link's EOF are read in either order. Here the
+    // EOF goes first, and the close is sent while the fence ping is in
+    // flight — after the engine released the session, before it can have
+    // read anything more from this link. An unfenced offer would say "held"
+    // to a link whose close then turns the session into a fresh dial.
+    const id = `fenced:${++counter}`;
+    const nick = `fenced${counter}`;
+    const a = await link();
+    await register(a, id, nick);
+    const b = await link();
+    a.kill();
+    await b.waitFor((f) => f.op === 'ping');
+    b.send({ op: 'close', id });
+    b.send({ op: 'pong' });
+    await gone(engine, id);
+    // Whatever the engine had to say about the offer was said before its
+    // answer to this ping.
+    b.send({ op: 'ping' });
+    await b.waitForNew((f) => f.op === 'pong');
+    expect(b.frames.some((f) => f.op === 'held')).toBe(false);
+    expect(b.frames.some((f) => f.op === 'error')).toBe(false);
+    await until(() => ircd.client(nick) === undefined, 5000, 'ircd saw it go');
+  });
+
+  it('offers a session that finished registering with nobody attached', async () => {
+    // A dial the dead link left behind: at b's hello it is not a session yet,
+    // so the hello cannot list it, and the release at a's death has nothing
+    // to offer either. Registration completing is the moment it becomes one.
+    const id = `late-reg:${++counter}`;
+    const nick = `latereg${counter}`;
+    const a = await link();
+    a.send(connectFrame(id));
+    await a.waitFor((f) => f.op === 'open' && f.id === id);
+    const b = await link();
+    expect(b.hello?.held).not.toContain(id);
+    a.send({ op: 'write', id, line: `NICK ${nick}` });
+    a.send({ op: 'write', id, line: `USER ${nick} 0 * :u` });
+    a.kill();
+    // Every ping is answered; the offer rides whichever one the session is a
+    // session by.
+    const held = b.waitFor((f) => f.op === 'held' && f.id === id);
+    const answer = (): void => {
+      void b
+        .waitForNew((f) => f.op === 'ping')
+        .then(
+          () => {
+            b.send({ op: 'pong' });
+            answer();
+          },
+          () => {},
+        );
+    };
+    answer();
+    await held;
+    b.send(connectFrame(id));
+    const att = await b.waitFor<Attached>((f) => f.op === 'attached' && f.id === id);
+    expect(att.unattended).toBe(true);
+  });
+
+  it("offers only to links of the session's instance", async () => {
+    const id = `mine:${++counter}`;
+    const a = await link();
+    await register(a, id, `mine${counter}`);
+    const stranger = await TestLink.connect(enginePort, SECRET, { instance: 'some-other-db' });
+    links.push(stranger);
+    const b = await link();
+    a.kill();
+    await b.waitFor((f) => f.op === 'ping');
+    b.send({ op: 'pong' });
+    await b.waitFor((f) => f.op === 'held' && f.id === id);
+    expect(stranger.frames.some((f) => f.op === 'ping' || f.op === 'held')).toBe(false);
+  });
+});
+
 describe('orphan reaper', () => {
   it('ends a session no link has claimed for orphanMs', async () => {
     const own = new EngineServer({
