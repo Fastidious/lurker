@@ -4,14 +4,15 @@
 // One held IRC socket. The engine's whole reason to exist is that this object
 // outlives the app process that asked for it.
 //
-// It understands exactly six IRC things, and nothing else:
+// It understands exactly seven IRC things, and nothing else:
 //   1. PING       — answered here, always, never forwarded. A detached (or
 //                   stalled) app can't ping out because the app isn't in the loop.
 //   2. 001        — our nick, as the server confirmed it.
 //   3. 376 / 422  — the end of the registration burst we record for replay.
 //   4. own NICK   — so a replay lands on the live nick.
 //   5. own JOIN / PART / KICK — the channel set a replay must re-enter.
-//   6. own CHGHOST — the hostmask the synthesised JOINs carry.
+//   6. RENAME — the same set, under the name the channel has now.
+//   7. own CHGHOST — the hostmask the synthesised JOINs carry.
 // Every other line is bytes: numbered, buffered until acked, relayed.
 //
 // Re-attach is a replay: the recorded burst (verbatim — irc-framework walks it
@@ -383,7 +384,9 @@ export class EngineUpstream extends EventEmitter {
   }
 
   // Apply an own-state line. Returns true when the line was own channel
-  // movement (JOIN/PART/KICK of us), which the burst must not record.
+  // movement (JOIN/PART/KICK of us, or a RENAME of a channel we are in), which
+  // the burst must not record: the replay re-enters the set as it stands now,
+  // and a recorded line would replay movement the set has since undone.
   private track(command: string, prefix: string | undefined, params: string[]): boolean {
     const from = prefixNick(prefix);
     if (command === 'NICK' && this.isSelf(from)) {
@@ -403,6 +406,24 @@ export class EngineUpstream extends EventEmitter {
     }
     if (command === 'KICK' && this.isSelf(params[1] || '')) {
       this.channels.delete((params[0] || '').toLowerCase());
+      return true;
+    }
+    // RENAME (draft/channel-rename, #858/#889): the channel kept every bit of
+    // its state and changed its name. The sender is whoever asked for it — an
+    // op, a service, the server — so this is deliberately NOT gated on isSelf;
+    // what makes it ours is that the old name is in our set. A replay built
+    // from the old name would put the fresh Client in a channel the server no
+    // longer has, and the restore's NAMES/TOPIC would go there too.
+    if (command === 'RENAME') {
+      const from = params[0] || '';
+      const to = params[1] || '';
+      if (!from || !to) return false;
+      const key = from.toLowerCase();
+      if (!this.channels.has(key)) return false;
+      this.channels.delete(key);
+      // A rename that only changes case renames the same key, so the delete
+      // above and this set are the same entry — it ends up spelled the new way.
+      this.channels.set(to.toLowerCase(), to);
       return true;
     }
     if (command === 'CHGHOST' && this.isSelf(from)) {

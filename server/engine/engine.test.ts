@@ -324,6 +324,39 @@ describe('attach after the app is gone', () => {
     expect(att.replay.filter((x) => /JOIN/.test(x))).toHaveLength(0);
   });
 
+  it('follows a RENAME of a channel it is in, whoever sent it (#889)', async () => {
+    const id = `rename:${++counter}`;
+    const a = await link();
+    await register(a, id, 'renamer');
+    a.send({ op: 'write', id, line: 'JOIN #old' });
+    await a.waitForLine(id, /JOIN #old/);
+    // draft/channel-rename: the sender is whoever asked for the rename — an op,
+    // a service, the server — never us. What makes it ours is that #old is in
+    // our set.
+    ircd.sendRaw('renamer', ':oper!o@peer.fake RENAME #old #new :tidy up');
+    await a.waitForLine(id, /RENAME #old #new/);
+    // A rename that only changes case is legal, and must leave the set spelled
+    // the new way.
+    ircd.sendRaw('renamer', ':oper!o@peer.fake RENAME #new #New :case only');
+    await a.waitForLine(id, /RENAME #new #New/);
+    ackAll(a, id);
+    a.kill();
+
+    const b = await link();
+    b.send(connectFrame(id));
+    const att = await b.waitFor<Attached>((f) => f.op === 'attached');
+    expect(att.channels).toEqual(['#New']);
+    expect(att.replay.filter((x) => /JOIN/.test(x))).toEqual([
+      ':renamer!~renamer@fake.host JOIN #New',
+    ]);
+    // The rename is replayed as the name the JOIN carries, never as a RENAME
+    // line: the fresh Client is in neither channel until the JOINs land, and an
+    // app that predates the cap would take one for a channel it is still in.
+    expect(att.replay.some((x) => /RENAME/.test(x))).toBe(false);
+    b.send({ op: 'close', id });
+    await gone(engine, id);
+  });
+
   it('newest link wins: the old link is told, not closed', async () => {
     const id = `takeover:${++counter}`;
     const a = await link();
@@ -654,6 +687,42 @@ describe('review findings', () => {
       await gone(engine, id);
     } finally {
       await forcing.close();
+    }
+  });
+
+  it('a RENAME during registration moves the set instead of joining the burst (#889)', async () => {
+    // A service puts us in a channel and renames it before the MOTD ends, so
+    // both lines fall inside the recorded burst's window.
+    const midBurst = await FakeIrcd.start({
+      burstLines: (c) => [
+        `:${c.nick}!~${c.user}@fake.host JOIN #burst`,
+        ':oper!o@peer.fake RENAME #burst #renamed :mid-registration',
+      ],
+    });
+    try {
+      const id = `burstrename:${++counter}`;
+      const a = await link();
+      a.send(connectFrame(id, { port: midBurst.port }));
+      await a.waitFor((f) => f.op === 'open' && f.id === id);
+      a.send({ op: 'write', id, line: 'NICK early' });
+      a.send({ op: 'write', id, line: 'USER early 0 * :e' });
+      await a.waitForLine(id, / 376 /);
+      ackAll(a, id);
+      a.kill();
+      const b = await link();
+      b.send(connectFrame(id, { port: midBurst.port }));
+      const att = await b.waitFor<Attached>((f) => f.op === 'attached');
+      expect(att.channels).toEqual(['#renamed']);
+      // Both lines are state: the JOIN because the set may since have undone
+      // it, the RENAME because replaying it would announce a rename that
+      // happened once, on every re-attach for the life of the socket.
+      expect(att.replay.filter((x) => /JOIN|RENAME/.test(x))).toEqual([
+        ':early!~early@fake.host JOIN #renamed',
+      ]);
+      b.send({ op: 'close', id });
+      await gone(engine, id);
+    } finally {
+      await midBurst.close();
     }
   });
 

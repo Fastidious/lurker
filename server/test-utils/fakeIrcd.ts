@@ -38,6 +38,11 @@ export interface FakeIrcdOptions {
   // Rename every client to this DURING registration (between 005 and the MOTD),
   // the way nick enforcement or a SANICK would.
   burstNickTo?: string;
+  // Raw lines injected in the same place, for the rest of what a server or a
+  // service can do to a client mid-registration (an auto-join, a rename of the
+  // channel it just put you in). Called per client so a line can carry the
+  // client's own hostmask.
+  burstLines?: (c: FakeClient) => string[];
   serverName?: string;
   network?: string;
   // Ask every TLS client for a certificate and record what it presents, the way
@@ -592,6 +597,7 @@ export class FakeIrcd extends EventEmitter {
       this.raw(c, `:${this.hostmask(c)} NICK :${to}`);
       c.nick = to;
     }
+    for (const line of this.opts.burstLines?.(c) ?? []) this.raw(c, line);
     this.num(c, '251', 'There are 1 users on 1 servers');
     if (this.opts.motd === false) {
       this.num(c, '422', 'MOTD File is missing');
