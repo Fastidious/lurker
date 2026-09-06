@@ -4287,6 +4287,7 @@ export class IrcConnection {
           topic: false,
         });
         this.rawQuiet('MODE', this.currentNick);
+        this.requestUnnegotiatedCaps();
         this.restoreQueue = [...this.channels.values()].map((ch) => ch.name);
         // Every queued channel is marked quiet now, not when its own step goes
         // out: the LAST process may have let go with a step in flight, and
@@ -4503,6 +4504,36 @@ export class IrcConnection {
     }
     if (step.owed.size === 0 && !this.disposed && this.state === 'connected') {
       this.drainRestoreQueue();
+    }
+  }
+
+  // Caps this app wants that the socket it just re-attached to never
+  // negotiated. The engine holds sockets across deploys, so a cap added in a
+  // release only reaches a held socket when the user next really reconnects —
+  // weeks, on a connection whose whole point is that it doesn't drop. A CAP REQ
+  // after registration is legal under CAP 302: the server answers ACK or NAK
+  // and no CAP END is owed. The ACK arrives as an ordinary line, and the engine
+  // records it so the NEXT re-attach replays it too (#888).
+  //
+  // Only the caps this app asked for through requestCap(): irc-framework's own
+  // want list is internal to its CAP handler, and it cannot drift under a held
+  // socket anyway — bumping irc-framework moves the engine image, and an engine
+  // recreate is a fresh dial with a fresh negotiation.
+  private requestUnnegotiatedCaps(): void {
+    const cap = this.client.network?.cap;
+    if (!cap) return;
+    const enabled = new Set(cap.enabled || []);
+    // Only what the server advertised: a REQ for a cap it never listed is
+    // answered with a NAK at best, and asking again on every re-attach for the
+    // life of the socket is not free.
+    const missing = (this.client.request_extra_caps || []).filter(
+      (name) => cap.available?.has(name) && !enabled.has(name),
+    );
+    if (missing.length === 0) return;
+    try {
+      this.client.raw(`CAP REQ :${missing.join(' ')}`);
+    } catch (_) {
+      /* ignore */
     }
   }
 

@@ -28,6 +28,7 @@ import type { Network } from '../db/networks.js';
 import { IrcConnection } from './ircConnection.js';
 import ircManager from './ircManager.js';
 import type { EngineServer } from '../engine/server.js';
+import { DEFAULT_CAPS } from '../test-utils/fakeIrcd.js';
 import type { FakeIrcd } from '../test-utils/fakeIrcd.js';
 import { startEngineHarness } from '../test-utils/engineHarness.js';
 import type { EngineHarness } from '../test-utils/engineHarness.js';
@@ -67,7 +68,13 @@ const until = (pred: () => boolean, ms = 5000, what = 'condition') =>
   });
 
 beforeAll(async () => {
-  harness = await startEngineHarness({ secret: SECRET });
+  harness = await startEngineHarness({
+    secret: SECRET,
+    // One cap nothing asks for at registration: irc-framework doesn't want it
+    // and neither does IrcConnection, so it is there for a LATER app version to
+    // discover on an already-registered socket (#888).
+    ircd: { caps: [...DEFAULT_CAPS, 'draft/channel-rename'] },
+  });
   ircd = harness.ircd;
   engine = harness.engine;
 
@@ -467,6 +474,50 @@ describe('IrcConnection through the engine', () => {
       heldSet.delete(foreign);
     }
   });
+
+  // #888: the engine holds sockets across deploys, so a cap a new app version
+  // starts asking for would otherwise wait for the user's next real reconnect.
+  it('a newer app negotiates a cap on the held socket, and the engine keeps it', async () => {
+    const CAP = 'draft/channel-rename';
+    const conn = ircManager.getConnection(userId, network.id)!;
+    expect(conn.state).toBe('connected');
+    // Advertised all along, wanted by nobody: this socket registered without it.
+    expect(conn.client.network.cap.enabled).not.toContain(CAP);
+    const registrations = ircd.registrations.filter((r) => r.nick === 'lurk').length;
+
+    // "Deploy": the app goes away and the one that replaces it wants one more
+    // cap than the socket ever negotiated.
+    ircManager.shutdown();
+    await until(() => engine.held().includes(engineId), 5000, 'engine holds it');
+    const next = new IrcConnection({ network, onEvent: () => {} });
+    next.client.requestCap(CAP);
+    next.connect();
+    await until(() => next.state === 'connected', 8000, 'reattached');
+    await until(
+      () => next.client.network.cap.enabled.includes(CAP),
+      8000,
+      'the cap was REQd and ACKed on the held socket',
+    );
+    expect(ircd.client('lurk')!.caps.has(CAP)).toBe(true);
+    // Negotiated on the socket it already had — not by reconnecting.
+    expect(ircd.registrations.filter((r) => r.nick === 'lurk')).toHaveLength(registrations);
+
+    // And it sticks: a third app that never asks for it still finds it on,
+    // because the engine recorded the live ACK and the replay carries it.
+    next.detach();
+    await until(() => next.state === 'disconnected', 5000, 'detached');
+    const third = new IrcConnection({ network, onEvent: () => {} });
+    third.connect();
+    await until(() => third.state === 'connected', 8000, 'reattached again');
+    expect(third.client.request_extra_caps).not.toContain(CAP);
+    expect(third.client.network.cap.enabled).toContain(CAP);
+    third.detach();
+    await until(() => third.state === 'disconnected', 5000, 'detached again');
+
+    // Leave a live connection behind for the last test.
+    const fresh = ircManager.startNetwork(userId, network.id)!;
+    await until(() => fresh.state === 'connected', 8000, 'fresh connection for the next test');
+  }, 30000);
 
   it('ircManager.shutdown() detaches; dispose still QUITs', async () => {
     ircManager.shutdown();

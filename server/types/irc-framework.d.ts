@@ -142,6 +142,11 @@ declare module 'irc-framework' {
     /** Request an IRCv3 capability during CAP negotiation. */
     requestCap(cap: string): void;
 
+    /** What requestCap() has been called with. irc-framework's OWN want list
+     *  (server-time, away-notify, …) lives inside its CAP handler and is not
+     *  exposed — this is only the caps the host asked for on top of it. */
+    readonly request_extra_caps: string[];
+
     /** Open a connection to the IRC server. */
     connect(options: ConnectOptions): void;
 

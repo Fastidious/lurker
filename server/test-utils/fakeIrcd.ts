@@ -78,7 +78,7 @@ export interface FakeClient {
   sent: string[];
 }
 
-const DEFAULT_CAPS = [
+export const DEFAULT_CAPS = [
   'server-time',
   'message-tags',
   'batch',
