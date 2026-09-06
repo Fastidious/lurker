@@ -390,8 +390,15 @@ export class EngineUpstream extends EventEmitter {
   // the tracked set rather than by looking for a channel prefix, so the engine
   // still needs to know nothing about what a channel name looks like — the
   // server told us on the JOIN.
+  //
+  // The trailing parameter is skipped: every numeric that names a channel puts
+  // it in a middle parameter (353's `= #chan :nicks`, 332's `#chan :topic`,
+  // 366, 324, 329, 333) and the trailing one is free text — a MOTD line that
+  // happens to read exactly `#chan` would otherwise be tagged to it and vanish
+  // from the replay the day we leave, punching a hole in a burst the recorder
+  // works to keep contiguous.
   private channelNamed(params: string[]): string | undefined {
-    for (const p of params) {
+    for (const p of params.slice(0, -1)) {
       const key = typeof p === 'string' ? p.toLowerCase() : '';
       if (key && this.channels.has(key)) return key;
     }

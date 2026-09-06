@@ -745,6 +745,9 @@ describe('review findings', () => {
         `:${c.nick}!~${c.user}@fake.host JOIN #auto`,
         `:fake.test 353 ${c.nick} = #auto :${c.nick} someone`,
         `:fake.test 366 ${c.nick} #auto :End of /NAMES list.`,
+        // Free text that happens to read exactly like the channel — a MOTD
+        // listing channels one per line. Not about it, and not to go with it.
+        `:fake.test 372 ${c.nick} :#auto`,
       ],
     });
     try {
@@ -776,7 +779,9 @@ describe('review findings', () => {
       c.send(connectFrame(id, { port: autoJoin.port }));
       const gone2 = await c.waitFor<Attached>((f) => f.op === 'attached');
       expect(gone2.channels).toEqual([]);
-      expect(gone2.replay.filter((x) => /#auto/.test(x))).toEqual([]);
+      // The channel's own lines are gone; the MOTD line that merely reads like
+      // it is still there, keeping the burst a contiguous registration.
+      expect(gone2.replay.filter((x) => /#auto/.test(x))).toEqual([':fake.test 372 early :#auto']);
       c.send({ op: 'close', id });
       await gone(engine, id);
     } finally {
