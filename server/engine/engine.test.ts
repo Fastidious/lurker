@@ -399,6 +399,10 @@ describe('attach after the app is gone', () => {
     await a.waitForLine(id, /CAP capped ACK :userhost-in-names/);
     ircd.sendRaw('capped', ':fake.test CAP capped DEL :away-notify');
     await a.waitForLine(id, /CAP capped DEL :away-notify/);
+    // No cap list at all: the last parameter is the subcommand, and reading it
+    // as one would enable a cap called "ACK".
+    ircd.sendRaw('capped', ':fake.test CAP capped ACK');
+    await a.waitForLine(id, /CAP capped ACK$/);
     ackAll(a, id);
     a.kill();
 

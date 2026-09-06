@@ -75,7 +75,7 @@ beforeAll(async () => {
     // version to discover on an already-registered socket. One the server
     // grants, one it advertises and then refuses. (#888)
     ircd: {
-      caps: [...DEFAULT_CAPS, 'draft/channel-rename', 'draft/refused'],
+      caps: [...DEFAULT_CAPS, 'draft/channel-rename', 'draft/refused', 'draft/granted'],
       refuse: ['draft/refused'],
     },
   });
@@ -528,12 +528,21 @@ describe('IrcConnection through the engine', () => {
     await until(() => engine.held().includes(engineId), 5000, 'engine holds it');
     const conn = new IrcConnection({ network, onEvent: () => {} });
     conn.client.requestCap('draft/refused');
+    // Asked for in the same restore. A REQ is all-or-nothing, so batching the
+    // two would have the server NAK both and put this one in the refusal set
+    // for good, though it would grant it on its own.
+    conn.client.requestCap('draft/granted');
     conn.connect();
     await until(() => conn.state === 'connected', 8000, 'reattached');
     await until(
       () => sentBy('lurk').includes('CAP REQ :draft/refused'),
       5000,
       'asked for the cap once',
+    );
+    await until(
+      () => conn.client.network.cap.enabled.includes('draft/granted'),
+      5000,
+      'the grantable one was granted',
     );
     // Advertised, so it stays in `available` and out of `enabled` for the life
     // of the socket — the shape that would otherwise ask again forever.

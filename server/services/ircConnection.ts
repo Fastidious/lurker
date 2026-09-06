@@ -4546,10 +4546,16 @@ export class IrcConnection {
       (name) => cap.available?.has(name) && !enabled.has(name) && !this.capsRefused.has(name),
     );
     if (missing.length === 0) return;
-    try {
-      this.client.raw(`CAP REQ :${missing.join(' ')}`);
-    } catch (_) {
-      /* ignore */
+    // One REQ per cap, not one batch: a REQ is all-or-nothing, so a server that
+    // would grant `batch` and refuse `draft/multiline` NAKs both — and the NAK
+    // names both, which would put a perfectly grantable cap in the refusal set
+    // for good. There are only ever a handful.
+    for (const name of missing) {
+      try {
+        this.client.raw(`CAP REQ :${name}`);
+      } catch (_) {
+        /* ignore */
+      }
     }
   }
 

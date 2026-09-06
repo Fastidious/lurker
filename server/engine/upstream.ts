@@ -429,6 +429,9 @@ export class EngineUpstream extends EventEmitter {
   // a live line — an app that can't see a cap simply doesn't ask for it, which
   // is the same answer it would have got from the server.
   private trackCaps(params: string[]): void {
+    // <target> <sub> :<caps>. Without the third the last parameter IS the
+    // subcommand, and reading it as a cap list enables a cap called "ACK".
+    if (params.length < 3) return;
     const sub = String(params[1] || '').toUpperCase();
     if (sub !== 'ACK' && sub !== 'DEL') return;
     for (const token of String(params[params.length - 1] || '').split(' ')) {
