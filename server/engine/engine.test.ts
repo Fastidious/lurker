@@ -339,6 +339,11 @@ describe('attach after the app is gone', () => {
     // the new way.
     ircd.sendRaw('renamer', ':oper!o@peer.fake RENAME #new #New :case only');
     await a.waitForLine(id, /RENAME #new #New/);
+    // A server spelling the line the client way — two parameters, the second
+    // its reason — must not be read as a rename to that text: the channel we
+    // are really in would be the thing that went missing.
+    ircd.sendRaw('renamer', ':oper!o@peer.fake RENAME #New :not a channel');
+    await a.waitForLine(id, /RENAME #New :not a channel/);
     ackAll(a, id);
     a.kill();
 
@@ -349,10 +354,6 @@ describe('attach after the app is gone', () => {
     expect(att.replay.filter((x) => /JOIN/.test(x))).toEqual([
       ':renamer!~renamer@fake.host JOIN #New',
     ]);
-    // The rename is replayed as the name the JOIN carries, never as a RENAME
-    // line: the fresh Client is in neither channel until the JOINs land, and an
-    // app that predates the cap would take one for a channel it is still in.
-    expect(att.replay.some((x) => /RENAME/.test(x))).toBe(false);
     b.send({ op: 'close', id });
     await gone(engine, id);
   });
@@ -696,6 +697,8 @@ describe('review findings', () => {
     const midBurst = await FakeIrcd.start({
       burstLines: (c) => [
         `:${c.nick}!~${c.user}@fake.host JOIN #burst`,
+        `:fake.test 353 ${c.nick} = #burst :${c.nick} someone`,
+        `:fake.test 366 ${c.nick} #burst :End of /NAMES list.`,
         ':oper!o@peer.fake RENAME #burst #renamed :mid-registration',
       ],
     });
@@ -719,10 +722,61 @@ describe('review findings', () => {
       expect(att.replay.filter((x) => /JOIN|RENAME/.test(x))).toEqual([
         ':early!~early@fake.host JOIN #renamed',
       ]);
+      // And nothing the burst recorded about the old name comes back: a 353
+      // for it would put the fresh Client straight back into a channel the
+      // server no longer has, whatever the synthesised JOINs say.
+      expect(att.replay.filter((x) => /#burst/.test(x))).toEqual([]);
       b.send({ op: 'close', id });
       await gone(engine, id);
     } finally {
       await midBurst.close();
+    }
+  });
+
+  it('replays a burst line about a channel only while it is still in it (#889)', async () => {
+    // A server-side auto-join during registration: the JOIN and its NAMES are
+    // inside the burst, where they stay for the life of the socket.
+    const autoJoin = await FakeIrcd.start({
+      burstLines: (c) => [
+        `:${c.nick}!~${c.user}@fake.host JOIN #auto`,
+        `:fake.test 353 ${c.nick} = #auto :${c.nick} someone`,
+        `:fake.test 366 ${c.nick} #auto :End of /NAMES list.`,
+      ],
+    });
+    try {
+      const id = `autojoin:${++counter}`;
+      const a = await link();
+      a.send(connectFrame(id, { port: autoJoin.port }));
+      await a.waitFor((f) => f.op === 'open' && f.id === id);
+      a.send({ op: 'write', id, line: 'NICK early' });
+      a.send({ op: 'write', id, line: 'USER early 0 * :e' });
+      await a.waitForLine(id, / 376 /);
+      ackAll(a, id);
+      a.kill();
+
+      // Still in it, so the burst's NAMES is still the truth about it.
+      const b = await link();
+      b.send(connectFrame(id, { port: autoJoin.port }));
+      const still = await b.waitFor<Attached>((f) => f.op === 'attached');
+      expect(still.channels).toEqual(['#auto']);
+      expect(still.replay.filter((x) => / 353 /.test(x))).toHaveLength(1);
+
+      // Now leave it. (Injected: burstLines is raw, so the fake ircd never
+      // made us a member and would answer a real PART with 442.)
+      autoJoin.sendRaw('early', ':early!~early@fake.host PART #auto');
+      await b.waitForLine(id, /PART #auto/);
+      ackAll(b, id);
+      b.kill();
+
+      const c = await link();
+      c.send(connectFrame(id, { port: autoJoin.port }));
+      const gone2 = await c.waitFor<Attached>((f) => f.op === 'attached');
+      expect(gone2.channels).toEqual([]);
+      expect(gone2.replay.filter((x) => /#auto/.test(x))).toEqual([]);
+      c.send({ op: 'close', id });
+      await gone(engine, id);
+    } finally {
+      await autoJoin.close();
     }
   });
 

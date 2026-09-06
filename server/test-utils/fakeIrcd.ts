@@ -41,7 +41,10 @@ export interface FakeIrcdOptions {
   // Raw lines injected in the same place, for the rest of what a server or a
   // service can do to a client mid-registration (an auto-join, a rename of the
   // channel it just put you in). Called per client so a line can carry the
-  // client's own hostmask.
+  // client's own hostmask. Deliberately raw: they go straight out and touch
+  // none of the fake's own bookkeeping, so an injected JOIN does NOT make the
+  // client a member — a later PART of it answers 442, and NAMES answers empty.
+  // Inject the replies you want too, or join for real.
   burstLines?: (c: FakeClient) => string[];
   serverName?: string;
   network?: string;
