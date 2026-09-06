@@ -344,6 +344,10 @@ describe('attach after the app is gone', () => {
     // are really in would be the thing that went missing.
     ircd.sendRaw('renamer', ':oper!o@peer.fake RENAME #New :not a channel');
     await a.waitForLine(id, /RENAME #New :not a channel/);
+    // Including a reason that opens with the channel it is about, which the
+    // prefix on its own reads as a rename.
+    ircd.sendRaw('renamer', ':oper!o@peer.fake RENAME #New :#New is moving to #Newer');
+    await a.waitForLine(id, /RENAME #New :#New is moving/);
     ackAll(a, id);
     a.kill();
 
