@@ -255,6 +255,9 @@ export class EngineServer {
     // Detect a dead peer host (the app can be on another box) rather than hold
     // its connections "attached" to a link that will never ack again.
     socket.setKeepAlive(true, 10_000);
+    // Every frame is small and every one is a line on its way to a person;
+    // Nagle would hold each behind the previous one's ack.
+    socket.setNoDelay(true);
     socket.on('data', (chunk: string) => this.onData(link, chunk));
     socket.on('drain', () => {
       for (const u of link.claimed) u.resume();

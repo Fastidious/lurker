@@ -290,6 +290,17 @@ export class EngineLink extends EventEmitter {
     this.socket?.destroy();
   }
 
+  // Stop for good. The link is half-closed, not destroyed: what was written
+  // just before this — at shutdown, every connection's `detach`, and any
+  // `close` a user's Disconnect became a moment earlier — must still get
+  // there. A destroy() closes the descriptor with those bytes possibly still
+  // queued (Nagle holds a small write until the previous one is acked, and
+  // that ack can be a delayed one), and when the engine has sent something we
+  // have not read yet the kernel answers the close with a RESET, which throws
+  // the queue away: the engine reads our earlier frames, then a reset, and the
+  // detach is gone — it still had the dead link's claim on the socket when the
+  // next process said hello (#894, Linux). A FIN pushes the queue first; the
+  // engine reads to EOF and ends its side, which closes ours.
   stop(): void {
     this.stopped = true;
     if (this.retryTimer) {
@@ -297,8 +308,15 @@ export class EngineLink extends EventEmitter {
       this.retryTimer = null;
     }
     this.stopHeartbeat();
-    this.socket?.destroy();
+    const socket = this.socket;
     this.socket = null;
+    if (!socket || socket.destroyed) return;
+    socket.end();
+    // A peer that never answers the FIN would keep the handle (and, at
+    // shutdown, the process) around — bound it.
+    const timer = setTimeout(() => socket.destroy(), 2000);
+    timer.unref();
+    socket.once('close', () => clearTimeout(timer));
   }
 
   private startHeartbeat(socket: net.Socket): void {
@@ -342,6 +360,10 @@ export class EngineLink extends EventEmitter {
     let sawHello = false;
     socket.setEncoding('utf8');
     socket.setKeepAlive(true, 10_000);
+    // Every frame is small and every one is a line on its way somewhere; Nagle
+    // would hold each behind the previous one's ack. (Also what made the last
+    // frame before a stop() droppable — see stop().)
+    socket.setNoDelay(true);
     socket.on('connect', () => {
       socket.write(
         encodeFrame({
@@ -449,6 +471,13 @@ export class EngineLink extends EventEmitter {
       case 'detached':
         this.heldSet.delete(frame.id);
         break;
+      case 'held':
+        // A session the hello could not list, offered now that it is
+        // unclaimed (protocol.ts). Not a transport's frame: nothing here has
+        // claimed it — that is the point — so it goes to whoever reconciles.
+        this.heldSet.add(frame.id);
+        this.emit('held', frame.id);
+        return;
       default:
         break;
     }
