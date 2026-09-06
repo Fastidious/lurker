@@ -341,13 +341,16 @@ describe('attach after the app is gone', () => {
     await a.waitForLine(id, /RENAME #new #New/);
     // A server spelling the line the client way — two parameters, the second
     // its reason — must not be read as a rename to that text: the channel we
-    // are really in would be the thing that went missing.
-    ircd.sendRaw('renamer', ':oper!o@peer.fake RENAME #New :not a channel');
-    await a.waitForLine(id, /RENAME #New :not a channel/);
-    // Including a reason that opens with the channel it is about, which the
-    // prefix on its own reads as a rename.
+    // are really in would be the thing that went missing. The reason can look
+    // like anything, including a bare channel name.
+    ircd.sendRaw('renamer', ':oper!o@peer.fake RENAME #New :#reason');
+    await a.waitForLine(id, /RENAME #New :#reason/);
     ircd.sendRaw('renamer', ':oper!o@peer.fake RENAME #New :#New is moving to #Newer');
     await a.waitForLine(id, /RENAME #New :#New is moving/);
+    // And a well-formed line whose new name is a LIST: a channel name cannot
+    // hold a comma, and taking one would drop the channel we are in.
+    ircd.sendRaw('renamer', ':oper!o@peer.fake RENAME #New #New,#Other :tidy');
+    await a.waitForLine(id, /RENAME #New #New,#Other/);
     ackAll(a, id);
     a.kill();
 

@@ -447,15 +447,14 @@ export class EngineUpstream extends EventEmitter {
       if (!oldName || !newName) return false;
       const key = oldName.toLowerCase();
       if (!this.channels.has(key)) return false;
-      // Two cheap tells that the second parameter really is a channel name: a
-      // rename keeps the channel's type (the spec lets a server refuse one that
-      // doesn't), and a channel name can hold neither a space nor a comma.
-      // Worth checking here and nowhere else in this file: a bogus JOIN only
-      // adds a phantom to the set, but a bogus rename would DROP the channel we
-      // are actually in — a server spelling the line with two parameters (the
-      // server form must carry the reason as a third) hands us its reason text
-      // as the new name, and a reason can begin with the channel it is about.
-      if (newName[0] !== oldName[0] || /[\s,]/.test(newName)) return false;
+      // The server form MUST carry the reason as a third parameter — an empty
+      // string when there is none, which still parses as a third parameter —
+      // so a two-parameter line is a server handing us its REASON as the new
+      // name. Checked here and nowhere else in this file because a bogus JOIN
+      // only adds a phantom to the set, while a bogus rename DROPS the channel
+      // we are actually in. A comma too: a channel name cannot hold one, and a
+      // server that answered with a list would take the real channel out.
+      if (params.length < 3 || /[\s,]/.test(newName)) return false;
       this.channels.delete(key);
       // A rename that only changes case renames the same key, so the delete
       // above and this set are the same entry — it ends up spelled the new way.
