@@ -143,6 +143,18 @@ describe('POST /api/networks', () => {
     expect(fakeManager.calls.some(([m]) => m === 'startNetwork')).toBe(true);
   });
 
+  // The body goes to createNetwork unvalidated, and a client that sends a
+  // number is taken at its word: 0 is off (it read as on until #894 found
+  // it), and a null is "unset", which is the default — on.
+  it('stores a numeric 0 as off and a null as the default', async () => {
+    const off = await makeNet(aliceAgent, { autoconnect: 0, name: 'num-off' });
+    expect(off.status).toBe(201);
+    expect(off.body.network.autoconnect).toBe(false);
+    const unset = await makeNet(aliceAgent, { autoconnect: null, name: 'null-unset' });
+    expect(unset.status).toBe(201);
+    expect(unset.body.network.autoconnect).toBe(true);
+  });
+
   it('500s and does not connect if createNetwork returns undefined', async () => {
     const networksDb = await import('../db/networks.js');
     const spy = vi.spyOn(networksDb, 'createNetwork').mockReturnValueOnce(undefined);

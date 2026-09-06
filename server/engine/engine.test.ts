@@ -1197,9 +1197,9 @@ describe('third review round', () => {
 
 // The hello's `held` list withholds what another link still claims — a dead
 // link's included, since the engine may read a replacement's hello before the
-// corpse's EOF (#849) — and until #894 nothing ever re-listed those. TestLink
-// answers nothing on its own, so the pong that lets an offer through is the
-// test's to send, which is what makes the fence observable.
+// corpse's EOF (#849) — and until #894 nothing ever re-listed those. An offer
+// can cross a `close` the link already sent; that is the app's to drop
+// (engineLink.test.ts), so nothing here waits for anything.
 describe('a session released after hello is offered (#894)', () => {
   it('offers the session a dead link still claimed at hello, once that link is gone', async () => {
     const id = `late:${++counter}`;
@@ -1210,11 +1210,6 @@ describe('a session released after hello is offered (#894)', () => {
     // Strict at hello, as before: a is still on the books.
     expect(b.hello?.held).not.toContain(id);
     a.kill();
-    // The engine asks before it tells: nothing is offered ahead of the pong.
-    await b.waitFor((f) => f.op === 'ping');
-    await new Promise((r) => setTimeout(r, 30));
-    expect(b.frames.some((f) => f.op === 'held')).toBe(false);
-    b.send({ op: 'pong' });
     expect(await b.waitFor((f) => f.op === 'held')).toMatchObject({ op: 'held', id });
     // And it is adoptable: the connect attaches, it does not dial.
     b.send(connectFrame(id));
@@ -1230,40 +1225,12 @@ describe('a session released after hello is offered (#894)', () => {
     const b = await link();
     expect(b.hello?.held).not.toContain(id);
     a.send({ op: 'detach', id });
-    await b.waitFor((f) => f.op === 'ping');
-    b.send({ op: 'pong' });
     expect(await b.waitFor((f) => f.op === 'held')).toMatchObject({ id });
-    expect(a.frames.some((f) => f.op === 'ping' || f.op === 'held')).toBe(false);
+    await new Promise((r) => setTimeout(r, 30));
+    expect(a.frames.some((f) => f.op === 'held')).toBe(false);
   });
 
-  it('a close the link had already sent wins: the offer is fenced behind a ping', async () => {
-    // #849's shape with the offer in it. A Disconnect issued during a link
-    // blip is flushed as a `close` the moment the replacement link is up, and
-    // that close and the dead link's EOF are read in either order. Here the
-    // EOF goes first, and the close is sent while the fence ping is in
-    // flight — after the engine released the session, before it can have
-    // read anything more from this link. An unfenced offer would say "held"
-    // to a link whose close then turns the session into a fresh dial.
-    const id = `fenced:${++counter}`;
-    const nick = `fenced${counter}`;
-    const a = await link();
-    await register(a, id, nick);
-    const b = await link();
-    a.kill();
-    await b.waitFor((f) => f.op === 'ping');
-    b.send({ op: 'close', id });
-    b.send({ op: 'pong' });
-    await gone(engine, id);
-    // Whatever the engine had to say about the offer was said before its
-    // answer to this ping.
-    b.send({ op: 'ping' });
-    await b.waitForNew((f) => f.op === 'pong');
-    expect(b.frames.some((f) => f.op === 'held')).toBe(false);
-    expect(b.frames.some((f) => f.op === 'error')).toBe(false);
-    await until(() => ircd.client(nick) === undefined, 5000, 'ircd saw it go');
-  });
-
-  it('offers a session that finished registering with nobody attached', async () => {
+  it('offers a session that finished registering after its link died', async () => {
     // A dial the dead link left behind: at b's hello it is not a session yet,
     // so the hello cannot list it, and the release at a's death has nothing
     // to offer either. Registration completing is the moment it becomes one.
@@ -1277,22 +1244,28 @@ describe('a session released after hello is offered (#894)', () => {
     a.send({ op: 'write', id, line: `NICK ${nick}` });
     a.send({ op: 'write', id, line: `USER ${nick} 0 * :u` });
     a.kill();
-    // Every ping is answered; the offer rides whichever one the session is a
-    // session by.
-    const held = b.waitFor((f) => f.op === 'held' && f.id === id);
-    const answer = (): void => {
-      void b
-        .waitForNew((f) => f.op === 'ping')
-        .then(
-          () => {
-            b.send({ op: 'pong' });
-            answer();
-          },
-          () => {},
-        );
-    };
-    answer();
-    await held;
+    await b.waitFor((f) => f.op === 'held' && f.id === id);
+    b.send(connectFrame(id));
+    const att = await b.waitFor<Attached>((f) => f.op === 'attached' && f.id === id);
+    expect(att.unattended).toBe(true);
+  });
+
+  it('does not offer a registration back to the link that let go of it mid-way', async () => {
+    // A detach is allowed from `open`, before 001 — and the link that sent it
+    // is still here. What registers afterwards is offered to the others only.
+    const id = `letgo-early:${++counter}`;
+    const nick = `letgoearly${counter}`;
+    const a = await link();
+    a.send(connectFrame(id));
+    await a.waitFor((f) => f.op === 'open' && f.id === id);
+    const b = await link();
+    expect(b.hello?.held).not.toContain(id);
+    a.send({ op: 'write', id, line: `NICK ${nick}` });
+    a.send({ op: 'write', id, line: `USER ${nick} 0 * :u` });
+    a.send({ op: 'detach', id });
+    await b.waitFor((f) => f.op === 'held' && f.id === id);
+    await new Promise((r) => setTimeout(r, 30));
+    expect(a.frames.some((f) => f.op === 'held')).toBe(false);
     b.send(connectFrame(id));
     const att = await b.waitFor<Attached>((f) => f.op === 'attached' && f.id === id);
     expect(att.unattended).toBe(true);
@@ -1306,10 +1279,9 @@ describe('a session released after hello is offered (#894)', () => {
     links.push(stranger);
     const b = await link();
     a.kill();
-    await b.waitFor((f) => f.op === 'ping');
-    b.send({ op: 'pong' });
     await b.waitFor((f) => f.op === 'held' && f.id === id);
-    expect(stranger.frames.some((f) => f.op === 'ping' || f.op === 'held')).toBe(false);
+    await new Promise((r) => setTimeout(r, 30));
+    expect(stranger.frames.some((f) => f.op === 'held')).toBe(false);
   });
 });
 

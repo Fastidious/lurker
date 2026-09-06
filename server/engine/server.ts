@@ -65,9 +65,6 @@ class AppLink implements FrameSink {
   // link touches must belong to it.
   instance = '';
   lastSeen = Date.now();
-  // Sessions to offer this link once it has answered the ping sent ahead of
-  // them, one batch per ping, in ping order. See offer().
-  readonly offers: EngineUpstream[][] = [];
 
   constructor(
     readonly socket: net.Socket,
@@ -93,6 +90,9 @@ export class EngineServer {
   private readonly log: (line: string) => void;
   private readonly secretDigest: Buffer;
   private sweepTimer: ReturnType<typeof setInterval> | null = null;
+  // The link that last let go of a session on purpose (release), so that a
+  // registration completing after the detach is not offered back to it.
+  private readonly releasedBy = new WeakMap<EngineUpstream, AppLink>();
 
   constructor(private readonly opts: EngineServerOptions) {
     this.budget = new ByteBudget(opts.bufferTotalBytes);
@@ -185,40 +185,25 @@ export class EngineServer {
   // hello's list is otherwise the last word, and a paused account's socket
   // then stayed on IRC until the orphan reaper (#894).
   //
-  // Not offered straight away, though. A link may have SENT a `close` for that
-  // very session that has not been read yet: a user's Disconnect during a link
-  // blip is flushed the moment the link is back, and the poll batch that has
-  // the replacement's hello ready can have the dead socket's EOF ready beside
-  // it, in no particular order (#849). An offer that overtook such a close
-  // would read as "still held", reconcile would attach, and the close applied
-  // a moment later would then hand the app a fresh dial — the Disconnect
-  // undone. So the offer queues behind a ping. Frames on a link are read in
-  // order, and the app answers a ping with a pong in its turn, so by the time
-  // the pong is read everything the link sent before it heard the ping has
-  // been read too — a session it closed meanwhile is `closing`, and the pong
-  // handler checks that before it says anything.
+  // An offer can cross a `close` the receiving link has already sent for that
+  // very session: a user's Disconnect during a link blip is flushed the moment
+  // the link is back, and the poll batch that has the replacement's hello
+  // ready can have the dead socket's EOF ready beside it, in no particular
+  // order (#849). The app is the side that can tell. Frames on a link are read
+  // in the order they were written, so a `held` that arrives after the app's
+  // own `close` for the id went out is stale by construction, and
+  // engineLink.ts drops it. (A fence here — ping, offer on the pong — covers
+  // less: a close sent after the pong and before the offer lands is the same
+  // race one round trip later.)
   private offer(released: EngineUpstream[], except: AppLink | null): void {
-    if (released.length === 0) return;
-    for (const link of this.links) {
-      if (link === except || !link.authed || link.socket.destroyed) continue;
-      const theirs = released.filter((u) => u.opts.instance === link.instance);
-      if (theirs.length === 0) continue;
-      link.offers.push(theirs);
-      link.send({ op: 'ping' });
-    }
-  }
-
-  // The app answered a ping: the fence in front of the oldest batch of offers
-  // is down (pongs come back in ping order). What is still a session, and
-  // still unclaimed — the link's own `connect` may have taken it meanwhile —
-  // is offered now.
-  private onPong(link: AppLink): void {
-    const batch = link.offers.shift();
-    if (!batch) return;
-    for (const u of batch) {
+    for (const u of released) {
       if (!this.isSession(u) || this.holderOf(u, null)) continue;
-      link.send({ op: 'held', id: u.id });
-      this.log(`${u.id}: offered to ${link.peer}`);
+      for (const link of this.links) {
+        if (link === except || !link.authed || link.socket.destroyed) continue;
+        if (link.instance !== u.opts.instance) continue;
+        link.send({ op: 'held', id: u.id });
+        this.log(`${u.id}: offered to ${link.peer}`);
+      }
     }
   }
 
@@ -401,7 +386,7 @@ export class EngineServer {
       case 'ping':
         return void link.send({ op: 'pong' });
       case 'pong':
-        return this.onPong(link);
+        return;
       case 'connect':
         return this.connect(link, frame);
       case 'list':
@@ -601,11 +586,11 @@ export class EngineServer {
       this.log(`${id}: open ${local.address}:${local.port} -> ${remote.address}:${remote.port}`);
     });
     const created = u;
-    // Registered with nobody attached: the link that dialed it is gone (or let
-    // go mid-registration), and the hello a successor sent meanwhile could not
+    // Registered with nobody attached: the link that dialed it is gone, or let
+    // go mid-registration — and a successor's hello sent meanwhile could not
     // list a socket that was not a session yet.
-    u.on('registered', () => {
-      if (!created.attached) this.offer([created], null);
+    u.on('registered', (unattended: boolean) => {
+      if (unattended) this.offer([created], this.releasedBy.get(created) ?? null);
     });
     u.on('closed', (error?: string) => {
       this.log(`${id}: closed${error ? ` (${error})` : ''}`);
@@ -633,6 +618,7 @@ export class EngineServer {
     if (!link.claimed.delete(u)) return;
     u.detach();
     this.log(`${u.id}: detached by ${link.peer} (pending ${u.buffer.length})`);
+    this.releasedBy.set(u, link);
     this.offer([u], link);
   }
 
