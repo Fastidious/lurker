@@ -495,7 +495,10 @@ describe('TLS and identd', () => {
       await l.waitFor((f) => f.op === 'open' && f.id === healthy);
       l.send({ op: 'write', id: healthy, line: 'NICK certy' });
       l.send({ op: 'write', id: healthy, line: 'USER certy 0 * :c' });
-      await l.waitForLine(healthy, / 001 /);
+      // 376, not 001: `held()` counts a session only once it is REGISTERED,
+      // and the burst ends at the MOTD. Stopping at 001 leaves the assertion
+      // below racing the rest of the burst — which it lost on CI.
+      await l.waitForLine(healthy, / 376 /);
       expect(secure.client('certy')!.certfp).toBe(describeClientCert(pair.cert).sha256);
 
       // A key that doesn't parse, and a pair that doesn't match: both refused
@@ -506,15 +509,19 @@ describe('TLS and identd', () => {
         { cert: pair.cert, key: other.key },
         { cert: pair.cert, key: '' },
       ]) {
+        const badId = `certfp-bad:${++counter}`;
         l.send(
-          connectFrame(`certfp-bad:${++counter}`, {
+          connectFrame(badId, {
             port: secure.port,
             tls: true,
             rejectUnauthorized: false,
             clientCert: bad,
           }),
         );
-        expect(await l.waitFor((f) => f.op === 'error')).toMatchObject({
+        // Matched by ITS id: waitFor scans the frames already in hand, so an
+        // unqualified `op === 'error'` would answer every pass after the first
+        // with the first pass's frame, and none of them would be a round trip.
+        expect(await l.waitFor((f) => f.op === 'error' && f.id === badId)).toMatchObject({
           message: expect.stringMatching(/clientCert/),
         });
       }
