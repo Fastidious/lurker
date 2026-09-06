@@ -33,6 +33,8 @@ import type { FakeIrcd } from '../test-utils/fakeIrcd.js';
 import { startEngineHarness } from '../test-utils/engineHarness.js';
 import type { EngineHarness } from '../test-utils/engineHarness.js';
 import { until as poll } from '../test-utils/until.js';
+import { TestLink } from '../test-utils/engineLink.js';
+import { instanceId } from '../db/instanceId.js';
 import { EngineLink, engineConnectionId, isOurConnectionId } from './engineLink.js';
 
 const SECRET = 'integration-secret';
@@ -351,6 +353,7 @@ describe('IrcConnection through the engine', () => {
     managerEvents.length = 0;
     const rowsBefore = rows().length;
     // autoconnect is 0 on this network, so initAll starts nothing itself…
+    expect(network.autoconnect).toBe(0);
     ircManager.initAll();
     // …and reconcile adopts what the engine kept.
     const adopted = ircManager.getConnection(userId, network.id);

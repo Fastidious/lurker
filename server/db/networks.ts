@@ -140,7 +140,9 @@ export function createNetwork(userId: number, fields: NetworkFields): Network | 
       username || null,
       realname || null,
       encryptSecret(server_password || null),
-      autoconnect === false ? 0 : 1,
+      // Default on; otherwise by truthiness, like trusted_certificates above —
+      // the option admits a number, and `0` must mean off (it read as on).
+      autoconnect === undefined ? 1 : autoconnect ? 1 : 0,
       encryptSecret(sasl_account || null),
       encryptSecret(sasl_password || null),
       encryptSecret(connect_commands || null),
