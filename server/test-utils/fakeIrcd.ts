@@ -55,6 +55,10 @@ export interface FakeIrcdOptions {
   // Offer SASL: advertises `sasl=<mechanisms>` in CAP LS and answers
   // AUTHENTICATE. Defaults to PLAIN + EXTERNAL when passed `true`.
   sasl?: boolean | { mechanisms: string[] };
+  // Caps that are advertised but NAKed when requested — a cap behind a
+  // privilege, or one the server lists and then declines. A REQ is
+  // all-or-nothing, so a batch containing one of these is NAKed whole.
+  refuse?: string[];
 }
 
 export interface FakeClient {
@@ -78,7 +82,7 @@ export interface FakeClient {
   sent: string[];
 }
 
-const DEFAULT_CAPS = [
+export const DEFAULT_CAPS = [
   'server-time',
   'message-tags',
   'batch',
@@ -502,7 +506,11 @@ export class FakeIrcd extends EventEmitter {
       // Match on the cap NAME: an advertised cap may carry a value (`sasl=PLAIN`),
       // and a client REQs the bare name.
       const offered = new Set(this.caps.map(capName));
-      const ok = wanted.every((w) => offered.has(capName(w.replace(/^-/, ''))));
+      const refused = new Set(this.opts.refuse ?? []);
+      const ok = wanted.every((w) => {
+        const name = capName(w.replace(/^-/, ''));
+        return offered.has(name) && !refused.has(name);
+      });
       if (ok) {
         for (const w of wanted) {
           if (w.startsWith('-')) c.caps.delete(w.slice(1));

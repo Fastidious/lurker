@@ -546,6 +546,13 @@ export class IrcConnection {
   private pendingJoinKeys = new Map<string, string>();
   userModes: Set<string>;
   awayState: AwayState;
+  // Caps this socket's server has answered a REQ for with a NAK. A refusal is
+  // an answer, and nothing in irc-framework records one: without this the
+  // post-restore REQ (requestUnnegotiatedCaps) would ask again every time the
+  // app re-attaches. Kept for the life of this connection object rather than
+  // cleared per socket — a fresh dial negotiates from CAP LS anyway, and that
+  // path never reads this. (#888)
+  private capsRefused: Set<string>;
   // One presence watch list keyed by lowercased nick. Each entry records WHY
   // we're watching it. The MONITOR watch and the shared peer_presence_state row
   // are reference-counted against those reasons — added when the first reason
@@ -806,6 +813,7 @@ export class IrcConnection {
     this.joinedFoldedCache = null;
     this.userModes = new Set();
     this.awayState = { active: false, message: null, since: null, autoSet: false, backAt: null };
+    this.capsRefused = new Set();
     // Lowercase nicks we watch for presence, each tagged with why. Gates the
     // per-peer presence writes so we don't churn the DB (and the WS broadcast
     // stream) on every JOIN/QUIT for an unrelated user on a busy network.
@@ -1278,6 +1286,11 @@ export class IrcConnection {
     // socket does die we must not reconnect-loop into the same rejection (which
     // on a server that requires auth is a fast failed-login hammer). We don't
     // publish here — the server's own error/ERROR line surfaces the cause.
+    c.on('cap nak', (event: Record<string, unknown>) => {
+      const caps = (event?.capabilities as Record<string, unknown> | undefined) || {};
+      for (const name of Object.keys(caps)) this.capsRefused.add(name);
+    });
+
     c.on('sasl failed', (event: Record<string, unknown>) => {
       const reason = (event?.reason as string | undefined) || undefined;
       if (isTerminalSaslFailure(reason)) {
@@ -4287,6 +4300,7 @@ export class IrcConnection {
           topic: false,
         });
         this.rawQuiet('MODE', this.currentNick);
+        this.requestUnnegotiatedCaps();
         this.restoreQueue = [...this.channels.values()].map((ch) => ch.name);
         // Every queued channel is marked quiet now, not when its own step goes
         // out: the LAST process may have let go with a step in flight, and
@@ -4503,6 +4517,45 @@ export class IrcConnection {
     }
     if (step.owed.size === 0 && !this.disposed && this.state === 'connected') {
       this.drainRestoreQueue();
+    }
+  }
+
+  // Caps this app wants that the socket it just re-attached to never
+  // negotiated. The engine holds sockets across deploys, so a cap added in a
+  // release only reaches a held socket when the user next really reconnects —
+  // weeks, on a connection whose whole point is that it doesn't drop. A CAP REQ
+  // after registration is legal under CAP 302: the server answers ACK or NAK
+  // and no CAP END is owed. The ACK arrives as an ordinary line, and the engine
+  // records it so the NEXT re-attach replays it too (#888).
+  //
+  // Only the caps this app asked for through requestCap(): irc-framework's own
+  // want list is internal to its CAP handler, and it cannot drift under a held
+  // socket anyway — bumping irc-framework moves the engine image, and an engine
+  // recreate is a fresh dial with a fresh negotiation.
+  private requestUnnegotiatedCaps(): void {
+    const cap = this.client.network?.cap;
+    if (!cap) return;
+    const enabled = new Set(cap.enabled || []);
+    // Only what the server advertised and has not already refused. Both halves
+    // matter: a cap the server never listed is a NAK at best, and one it NAKed
+    // stays advertised-but-not-enabled for the life of the socket — so without
+    // the refusal set this would re-send the identical REQ on every re-attach,
+    // which on a socket whose whole point is that it never drops is every
+    // deploy and every link blip, forever.
+    const missing = (this.client.request_extra_caps || []).filter(
+      (name) => cap.available?.has(name) && !enabled.has(name) && !this.capsRefused.has(name),
+    );
+    if (missing.length === 0) return;
+    // One REQ per cap, not one batch: a REQ is all-or-nothing, so a server that
+    // would grant `batch` and refuse `draft/multiline` NAKs both — and the NAK
+    // names both, which would put a perfectly grantable cap in the refusal set
+    // for good. There are only ever a handful.
+    for (const name of missing) {
+      try {
+        this.client.raw(`CAP REQ :${name}`);
+      } catch (_) {
+        /* ignore */
+      }
     }
   }
 

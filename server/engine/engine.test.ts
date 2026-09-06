@@ -79,6 +79,27 @@ function connectFrame(
   };
 }
 
+// The same, with a CAP handshake first, so the recorded burst carries the
+// server's ACK — the baseline a replay's cap delta is measured against.
+async function registerWithCaps(
+  l: TestLink,
+  id: string,
+  nick: string,
+  caps: string[],
+): Promise<void> {
+  l.send(connectFrame(id));
+  await l.waitFor((f) => f.op === 'open' && f.id === id);
+  l.send({ op: 'write', id, line: 'CAP LS 302' });
+  // The last LS line of a 302 handshake is the one without the `*`.
+  await l.waitForLine(id, / CAP \* LS :/);
+  l.send({ op: 'write', id, line: `CAP REQ :${caps.join(' ')}` });
+  await l.waitForLine(id, / CAP \* ACK /);
+  l.send({ op: 'write', id, line: 'CAP END' });
+  l.send({ op: 'write', id, line: `NICK ${nick}` });
+  l.send({ op: 'write', id, line: `USER ${nick} 0 * :${nick}` });
+  await l.waitForLine(id, / 376 /);
+}
+
 // Dial through the engine and register on the fake ircd with plain NICK/USER.
 async function register(l: TestLink, id: string, nick: string): Promise<void> {
   l.send(connectFrame(id));
@@ -361,6 +382,43 @@ describe('attach after the app is gone', () => {
     expect(att.replay.filter((x) => /JOIN/.test(x))).toEqual([
       ':renamer!~renamer@fake.host JOIN #New',
     ]);
+    b.send({ op: 'close', id });
+    await gone(engine, id);
+  });
+
+  it('replays the caps that changed after the burst, both ways (#888)', async () => {
+    const id = `caps:${++counter}`;
+    const a = await link();
+    await registerWithCaps(a, id, 'capped', ['away-notify', 'multi-prefix']);
+    a.send({ op: 'write', id, line: 'JOIN #c' });
+    await a.waitForLine(id, /JOIN #c/);
+    // cap-notify in the wild: this app asks for one more, and the server takes
+    // one away. Both are live lines — relayed once, then forgotten with the ack
+    // — so the burst on its own stops describing the socket here.
+    a.send({ op: 'write', id, line: 'CAP REQ :userhost-in-names' });
+    await a.waitForLine(id, /CAP capped ACK :userhost-in-names/);
+    ircd.sendRaw('capped', ':fake.test CAP capped DEL :away-notify');
+    await a.waitForLine(id, /CAP capped DEL :away-notify/);
+    // No cap list at all: the last parameter is the subcommand, and reading it
+    // as one would enable a cap called "ACK".
+    ircd.sendRaw('capped', ':fake.test CAP capped ACK');
+    await a.waitForLine(id, /CAP capped ACK$/);
+    ackAll(a, id);
+    a.kill();
+
+    const b = await link();
+    b.send(connectFrame(id));
+    const att = await b.waitFor<Attached>((f) => f.op === 'attached');
+    // The burst's own CAP lines, then the delta it cannot carry.
+    expect(att.replay.filter((x) => / CAP /.test(x)).slice(-2)).toEqual([
+      ':fake.test CAP capped DEL :away-notify',
+      ':fake.test CAP capped ACK :userhost-in-names',
+    ]);
+    // Registration first, then the caps, then the state: a cap that changes how
+    // a JOIN is read has to be in force before the synthesised JOINs land.
+    expect(att.replay.findIndex((x) => /CAP capped ACK/.test(x))).toBeLessThan(
+      att.replay.findIndex((x) => /JOIN #c/.test(x)),
+    );
     b.send({ op: 'close', id });
     await gone(engine, id);
   });

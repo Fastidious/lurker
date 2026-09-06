@@ -4,7 +4,7 @@
 // One held IRC socket. The engine's whole reason to exist is that this object
 // outlives the app process that asked for it.
 //
-// It understands exactly seven IRC things, and nothing else:
+// It understands exactly eight IRC things, and nothing else:
 //   1. PING       — answered here, always, never forwarded. A detached (or
 //                   stalled) app can't ping out because the app isn't in the loop.
 //   2. 001        — our nick, as the server confirmed it.
@@ -12,7 +12,9 @@
 //   4. own NICK   — so a replay lands on the live nick.
 //   5. own JOIN / PART / KICK — the channel set a replay must re-enter.
 //   6. RENAME — the same set, under the name the channel has now.
-//   7. own CHGHOST — the hostmask the synthesised JOINs carry.
+//   7. CAP ACK / DEL — the caps that are on, which the burst alone stops
+//                   describing the moment one changes.
+//   8. own CHGHOST — the hostmask the synthesised JOINs carry.
 // Every other line is bytes: numbered, buffered until acked, relayed.
 //
 // Re-attach is a replay: the recorded burst (verbatim — irc-framework walks it
@@ -151,6 +153,18 @@ export class EngineUpstream extends EventEmitter {
   private registeredUnattended = false;
   private nickAtBurstEnd: string | null = null;
   private hostmask: string | null = null;
+  // The caps the server has said are on for this socket, from the first CAP
+  // ACK onwards. A cap-notify exchange after registration (a `CAP NEW` we
+  // asked for, a `CAP DEL` the server sent) is an ordinary live line: relayed
+  // once and dropped from the buffer as soon as the app acks it. The burst
+  // stops being the truth about this socket the moment one lands. (#888)
+  private caps = new Set<string>();
+  // What the burst on its own leaves a fresh Client with — the baseline the
+  // replay's delta is measured against. Null until the burst closes.
+  private capsAtBurstEnd: Set<string> | null = null;
+  // The server's own name, off the 001 prefix, so a synthesised CAP line looks
+  // like the ones around it.
+  private serverName: string | null = null;
   // folded name → name as the server spelled it on JOIN
   private channels = new Map<string, string>();
 
@@ -343,7 +357,11 @@ export class EngineUpstream extends EventEmitter {
       if (!this.sink) this.pingsAnsweredDetached++;
       return;
     }
-    if (command === '001') this.nick = msg.params[0] || null;
+    if (command === '001') {
+      this.nick = msg.params[0] || null;
+      this.serverName = msg.prefix || null;
+    }
+    if (command === 'CAP') this.trackCaps(msg.params);
     // Own state is tracked from the first line on — a NICK forced on us between
     // 001 and 376, or a server that JOINs us to a channel during registration,
     // must not be missed just because the burst is still open.
@@ -356,6 +374,7 @@ export class EngineUpstream extends EventEmitter {
       }
       if (command === '376' || command === '422') {
         this.burstDone = true;
+        this.capsAtBurstEnd = new Set(this.caps);
         this.nickAtBurstEnd = this.nick;
         this.registeredUnattended = this.sink === null;
       }
@@ -403,6 +422,29 @@ export class EngineUpstream extends EventEmitter {
       if (key && this.channels.has(key)) return key;
     }
     return undefined;
+  }
+
+  // The two CAP subcommands that change what is ON. LS and NEW only advertise,
+  // and what they advertise is either in the burst already or is re-learned from
+  // a live line — an app that can't see a cap simply doesn't ask for it, which
+  // is the same answer it would have got from the server.
+  private trackCaps(params: string[]): void {
+    // <target> <sub> :<caps>. Without the third the last parameter IS the
+    // subcommand, and reading it as a cap list enables a cap called "ACK".
+    if (params.length < 3) return;
+    const sub = String(params[1] || '').toUpperCase();
+    if (sub !== 'ACK' && sub !== 'DEL') return;
+    for (const token of String(params[params.length - 1] || '').split(' ')) {
+      if (!token) continue;
+      // `CAP ACK :-away-notify` is the server confirming a cap went OFF (the
+      // answer to a `CAP REQ :-away-notify`). Nothing in Lurker sends one, but
+      // reading it as an enable would be a lie the replay then repeats.
+      const off = sub === 'DEL' || token.startsWith('-');
+      const name = (token.startsWith('-') ? token.slice(1) : token).split('=')[0];
+      if (!name) continue;
+      if (off) this.caps.delete(name);
+      else this.caps.add(name);
+    }
   }
 
   private isSelf(nick: string): boolean {
@@ -602,12 +644,34 @@ export class EngineUpstream extends EventEmitter {
     // to a channel the server no longer has. (#889)
     const out = this.burst.filter((b) => !b.chan || this.channels.has(b.chan)).map((b) => b.line);
     if (!this.nick) return out;
+    out.push(...this.capDelta());
     const userhost = this.hostmask || FALLBACK_USERHOST;
     if (this.nickAtBurstEnd && this.nickAtBurstEnd !== this.nick) {
       out.push(`:${this.nickAtBurstEnd}!${userhost} NICK :${this.nick}`);
     }
     for (const chan of this.channels.values()) out.push(`:${this.nick}!${userhost} JOIN ${chan}`);
     return out;
+  }
+
+  // What the caps have done since the burst closed, as the two lines that would
+  // have got them there. irc-framework applies a post-registration ACK and DEL
+  // to the enabled set exactly as it applies the ones inside negotiation, so a
+  // fresh Client walking the replay ends up with the set this socket really
+  // has — including a cap a NEWER app asked for on an already-restored socket,
+  // which is what makes that request stick across the deploy after it. (#888)
+  private capDelta(): string[] {
+    const before = this.capsAtBurstEnd;
+    if (!before) return [];
+    const gone = [...before].filter((cap) => !this.caps.has(cap));
+    const added = [...this.caps].filter((cap) => !before.has(cap));
+    const from = this.serverName ? `:${this.serverName} ` : '';
+    // Addressed to the nick the replay is at by this point — the burst's — not
+    // the one the synthesised NICK below moves it to.
+    const target = this.nickAtBurstEnd || this.nick || '*';
+    const lines: string[] = [];
+    if (gone.length > 0) lines.push(`${from}CAP ${target} DEL :${gone.join(' ')}`);
+    if (added.length > 0) lines.push(`${from}CAP ${target} ACK :${added.join(' ')}`);
+    return lines;
   }
 
   // End the socket. The app asked (a QUIT went out first, or a user disconnected).
