@@ -324,6 +324,47 @@ describe('attach after the app is gone', () => {
     expect(att.replay.filter((x) => /JOIN/.test(x))).toHaveLength(0);
   });
 
+  it('follows a RENAME of a channel it is in, whoever sent it (#889)', async () => {
+    const id = `rename:${++counter}`;
+    const a = await link();
+    await register(a, id, 'renamer');
+    a.send({ op: 'write', id, line: 'JOIN #old' });
+    await a.waitForLine(id, /JOIN #old/);
+    // draft/channel-rename: the sender is whoever asked for the rename — an op,
+    // a service, the server — never us. What makes it ours is that #old is in
+    // our set.
+    ircd.sendRaw('renamer', ':oper!o@peer.fake RENAME #old #new :tidy up');
+    await a.waitForLine(id, /RENAME #old #new/);
+    // A rename that only changes case is legal, and must leave the set spelled
+    // the new way.
+    ircd.sendRaw('renamer', ':oper!o@peer.fake RENAME #new #New :case only');
+    await a.waitForLine(id, /RENAME #new #New/);
+    // A server spelling the line the client way — two parameters, the second
+    // its reason — must not be read as a rename to that text: the channel we
+    // are really in would be the thing that went missing. The reason can look
+    // like anything, including a bare channel name.
+    ircd.sendRaw('renamer', ':oper!o@peer.fake RENAME #New :#reason');
+    await a.waitForLine(id, /RENAME #New :#reason/);
+    ircd.sendRaw('renamer', ':oper!o@peer.fake RENAME #New :#New is moving to #Newer');
+    await a.waitForLine(id, /RENAME #New :#New is moving/);
+    // And a well-formed line whose new name is a LIST: a channel name cannot
+    // hold a comma, and taking one would drop the channel we are in.
+    ircd.sendRaw('renamer', ':oper!o@peer.fake RENAME #New #New,#Other :tidy');
+    await a.waitForLine(id, /RENAME #New #New,#Other/);
+    ackAll(a, id);
+    a.kill();
+
+    const b = await link();
+    b.send(connectFrame(id));
+    const att = await b.waitFor<Attached>((f) => f.op === 'attached');
+    expect(att.channels).toEqual(['#New']);
+    expect(att.replay.filter((x) => /JOIN/.test(x))).toEqual([
+      ':renamer!~renamer@fake.host JOIN #New',
+    ]);
+    b.send({ op: 'close', id });
+    await gone(engine, id);
+  });
+
   it('newest link wins: the old link is told, not closed', async () => {
     const id = `takeover:${++counter}`;
     const a = await link();
@@ -454,7 +495,10 @@ describe('TLS and identd', () => {
       await l.waitFor((f) => f.op === 'open' && f.id === healthy);
       l.send({ op: 'write', id: healthy, line: 'NICK certy' });
       l.send({ op: 'write', id: healthy, line: 'USER certy 0 * :c' });
-      await l.waitForLine(healthy, / 001 /);
+      // 376, not 001: `held()` counts a session only once it is REGISTERED,
+      // and the burst ends at the MOTD. Stopping at 001 leaves the assertion
+      // below racing the rest of the burst — which it lost on CI.
+      await l.waitForLine(healthy, / 376 /);
       expect(secure.client('certy')!.certfp).toBe(describeClientCert(pair.cert).sha256);
 
       // A key that doesn't parse, and a pair that doesn't match: both refused
@@ -465,15 +509,19 @@ describe('TLS and identd', () => {
         { cert: pair.cert, key: other.key },
         { cert: pair.cert, key: '' },
       ]) {
+        const badId = `certfp-bad:${++counter}`;
         l.send(
-          connectFrame(`certfp-bad:${++counter}`, {
+          connectFrame(badId, {
             port: secure.port,
             tls: true,
             rejectUnauthorized: false,
             clientCert: bad,
           }),
         );
-        expect(await l.waitFor((f) => f.op === 'error')).toMatchObject({
+        // Matched by ITS id: waitFor scans the frames already in hand, so an
+        // unqualified `op === 'error'` would answer every pass after the first
+        // with the first pass's frame, and none of them would be a round trip.
+        expect(await l.waitFor((f) => f.op === 'error' && f.id === badId)).toMatchObject({
           message: expect.stringMatching(/clientCert/),
         });
       }
@@ -654,6 +702,100 @@ describe('review findings', () => {
       await gone(engine, id);
     } finally {
       await forcing.close();
+    }
+  });
+
+  it('a RENAME during registration moves the set instead of joining the burst (#889)', async () => {
+    // A service puts us in a channel and renames it before the MOTD ends, so
+    // both lines fall inside the recorded burst's window.
+    const midBurst = await FakeIrcd.start({
+      burstLines: (c) => [
+        `:${c.nick}!~${c.user}@fake.host JOIN #burst`,
+        `:fake.test 353 ${c.nick} = #burst :${c.nick} someone`,
+        `:fake.test 366 ${c.nick} #burst :End of /NAMES list.`,
+        ':oper!o@peer.fake RENAME #burst #renamed :mid-registration',
+      ],
+    });
+    try {
+      const id = `burstrename:${++counter}`;
+      const a = await link();
+      a.send(connectFrame(id, { port: midBurst.port }));
+      await a.waitFor((f) => f.op === 'open' && f.id === id);
+      a.send({ op: 'write', id, line: 'NICK early' });
+      a.send({ op: 'write', id, line: 'USER early 0 * :e' });
+      await a.waitForLine(id, / 376 /);
+      ackAll(a, id);
+      a.kill();
+      const b = await link();
+      b.send(connectFrame(id, { port: midBurst.port }));
+      const att = await b.waitFor<Attached>((f) => f.op === 'attached');
+      expect(att.channels).toEqual(['#renamed']);
+      // Both lines are state: the JOIN because the set may since have undone
+      // it, the RENAME because replaying it would announce a rename that
+      // happened once, on every re-attach for the life of the socket.
+      expect(att.replay.filter((x) => /JOIN|RENAME/.test(x))).toEqual([
+        ':early!~early@fake.host JOIN #renamed',
+      ]);
+      // And nothing the burst recorded about the old name comes back: a 353
+      // for it would put the fresh Client straight back into a channel the
+      // server no longer has, whatever the synthesised JOINs say.
+      expect(att.replay.filter((x) => /#burst/.test(x))).toEqual([]);
+      b.send({ op: 'close', id });
+      await gone(engine, id);
+    } finally {
+      await midBurst.close();
+    }
+  });
+
+  it('replays a burst line about a channel only while it is still in it (#889)', async () => {
+    // A server-side auto-join during registration: the JOIN and its NAMES are
+    // inside the burst, where they stay for the life of the socket.
+    const autoJoin = await FakeIrcd.start({
+      burstLines: (c) => [
+        `:${c.nick}!~${c.user}@fake.host JOIN #auto`,
+        `:fake.test 353 ${c.nick} = #auto :${c.nick} someone`,
+        `:fake.test 366 ${c.nick} #auto :End of /NAMES list.`,
+        // Free text that happens to read exactly like the channel — a MOTD
+        // listing channels one per line. Not about it, and not to go with it.
+        `:fake.test 372 ${c.nick} :#auto`,
+      ],
+    });
+    try {
+      const id = `autojoin:${++counter}`;
+      const a = await link();
+      a.send(connectFrame(id, { port: autoJoin.port }));
+      await a.waitFor((f) => f.op === 'open' && f.id === id);
+      a.send({ op: 'write', id, line: 'NICK early' });
+      a.send({ op: 'write', id, line: 'USER early 0 * :e' });
+      await a.waitForLine(id, / 376 /);
+      ackAll(a, id);
+      a.kill();
+
+      // Still in it, so the burst's NAMES is still the truth about it.
+      const b = await link();
+      b.send(connectFrame(id, { port: autoJoin.port }));
+      const still = await b.waitFor<Attached>((f) => f.op === 'attached');
+      expect(still.channels).toEqual(['#auto']);
+      expect(still.replay.filter((x) => / 353 /.test(x))).toHaveLength(1);
+
+      // Now leave it. (Injected: burstLines is raw, so the fake ircd never
+      // made us a member and would answer a real PART with 442.)
+      autoJoin.sendRaw('early', ':early!~early@fake.host PART #auto');
+      await b.waitForLine(id, /PART #auto/);
+      ackAll(b, id);
+      b.kill();
+
+      const c = await link();
+      c.send(connectFrame(id, { port: autoJoin.port }));
+      const gone2 = await c.waitFor<Attached>((f) => f.op === 'attached');
+      expect(gone2.channels).toEqual([]);
+      // The channel's own lines are gone; the MOTD line that merely reads like
+      // it is still there, keeping the burst a contiguous registration.
+      expect(gone2.replay.filter((x) => /#auto/.test(x))).toEqual([':fake.test 372 early :#auto']);
+      c.send({ op: 'close', id });
+      await gone(engine, id);
+    } finally {
+      await autoJoin.close();
     }
   });
 

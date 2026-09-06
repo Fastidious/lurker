@@ -21,7 +21,12 @@ export const PROTOCOL_MAJOR = 1;
 // needs one refuses to dial through an engine below this rather than connecting
 // as an unrecognised stranger — an older engine would ignore the field, and
 // silence is indistinguishable from success on the app side.
-export const PROTOCOL_MINOR = 2;
+// minor 3 (#889): the engine follows RENAME in its tracked channel set, so a
+// re-attach replays the name a channel has now. An engine below this replays
+// the name it had at the rename — silently, and for the life of the socket —
+// which is why the app half of draft/channel-rename (#858) has a minor to gate
+// on rather than having to assume.
+export const PROTOCOL_MINOR = 3;
 
 // One frame is one JSON object on one line. Most wrap a single IRC line (≤ 8191
 // bytes with tags); the one large frame is `attached`, whose replay is bounded by

@@ -4,14 +4,15 @@
 // One held IRC socket. The engine's whole reason to exist is that this object
 // outlives the app process that asked for it.
 //
-// It understands exactly six IRC things, and nothing else:
+// It understands exactly seven IRC things, and nothing else:
 //   1. PING       — answered here, always, never forwarded. A detached (or
 //                   stalled) app can't ping out because the app isn't in the loop.
 //   2. 001        — our nick, as the server confirmed it.
 //   3. 376 / 422  — the end of the registration burst we record for replay.
 //   4. own NICK   — so a replay lands on the live nick.
 //   5. own JOIN / PART / KICK — the channel set a replay must re-enter.
-//   6. own CHGHOST — the hostmask the synthesised JOINs carry.
+//   6. RENAME — the same set, under the name the channel has now.
+//   7. own CHGHOST — the hostmask the synthesised JOINs carry.
 // Every other line is bytes: numbered, buffered until acked, relayed.
 //
 // Re-attach is a replay: the recorded burst (verbatim — irc-framework walks it
@@ -27,7 +28,9 @@
 // no matter how long the socket has lived: the burst is capped in bytes, the
 // nick is one line, and the channel set is what we are in NOW (own JOIN/PART/
 // KICK lines are deliberately not recorded into the burst, so a channel joined
-// during registration and left later is not replayed as joined).
+// during registration and left later is not replayed as joined). A burst line
+// ABOUT such a channel — the 353/366/332 a server-side auto-join volunteers —
+// is held back at replay time for the same reason: see replaySet.
 
 import net from 'node:net';
 import tls from 'node:tls';
@@ -134,7 +137,10 @@ export class EngineUpstream extends EventEmitter {
   private inbuf = '';
   private lastError: string | null = null;
   private identdId: number | null = null;
-  private burst: string[] = [];
+  // The recorded registration burst. Each line remembers which of our channels
+  // it was about (folded), if any, so a replay can leave out what is no longer
+  // true — see replaySet.
+  private burst: Array<{ line: string; chan?: string }> = [];
   private burstBytes = 0;
   // Latched once a line didn't fit, so the burst is a contiguous prefix.
   private burstFull = false;
@@ -345,7 +351,9 @@ export class EngineUpstream extends EventEmitter {
     if (!this.burstDone) {
       // Own channel movement is state, replayed from the channel set; recording
       // the line too would replay a JOIN the tracked set may since have undone.
-      if (!ownState) this.recordBurst(line, command === '376' || command === '422');
+      if (!ownState) {
+        this.recordBurst(line, msg.params, command === '376' || command === '422');
+      }
       if (command === '376' || command === '422') {
         this.burstDone = true;
         this.nickAtBurstEnd = this.nick;
@@ -368,14 +376,33 @@ export class EngineUpstream extends EventEmitter {
   // emits 'motd' only on 376/422, and that event is the one thing that renders
   // the block, since 372/375/376 are on the app's numeric denylist. It is one
   // short line, and it is what makes the truncation well-formed.
-  private recordBurst(line: string, force = false): void {
+  private recordBurst(line: string, params: string[], force = false): void {
     const bytes = Buffer.byteLength(line, 'utf8') + 2;
     if (this.burstFull || this.burstBytes + bytes > MAX_BURST_BYTES) {
       this.burstFull = true;
       if (!force) return;
     }
-    this.burst.push(line);
+    this.burst.push({ line, chan: this.channelNamed(params) });
     this.burstBytes += bytes;
+  }
+
+  // Which of the channels we are in this line names, if any. Matched against
+  // the tracked set rather than by looking for a channel prefix, so the engine
+  // still needs to know nothing about what a channel name looks like — the
+  // server told us on the JOIN.
+  //
+  // The trailing parameter is skipped: every numeric that names a channel puts
+  // it in a middle parameter (353's `= #chan :nicks`, 332's `#chan :topic`,
+  // 366, 324, 329, 333) and the trailing one is free text — a MOTD line that
+  // happens to read exactly `#chan` would otherwise be tagged to it and vanish
+  // from the replay the day we leave, punching a hole in a burst the recorder
+  // works to keep contiguous.
+  private channelNamed(params: string[]): string | undefined {
+    for (const p of params.slice(0, -1)) {
+      const key = typeof p === 'string' ? p.toLowerCase() : '';
+      if (key && this.channels.has(key)) return key;
+    }
+    return undefined;
   }
 
   private isSelf(nick: string): boolean {
@@ -383,7 +410,9 @@ export class EngineUpstream extends EventEmitter {
   }
 
   // Apply an own-state line. Returns true when the line was own channel
-  // movement (JOIN/PART/KICK of us), which the burst must not record.
+  // movement (JOIN/PART/KICK of us, or a RENAME of a channel we are in), which
+  // the burst must not record: the replay re-enters the set as it stands now,
+  // and a recorded line would replay movement the set has since undone.
   private track(command: string, prefix: string | undefined, params: string[]): boolean {
     const from = prefixNick(prefix);
     if (command === 'NICK' && this.isSelf(from)) {
@@ -403,6 +432,33 @@ export class EngineUpstream extends EventEmitter {
     }
     if (command === 'KICK' && this.isSelf(params[1] || '')) {
       this.channels.delete((params[0] || '').toLowerCase());
+      return true;
+    }
+    // RENAME (draft/channel-rename, #858/#889): the channel kept every bit of
+    // its state and changed its name. The sender is whoever asked for it — an
+    // op, a service, the server — so this is deliberately NOT gated on isSelf;
+    // what makes it ours is that the old name is in our set. A replay built
+    // from the old name would put the fresh Client in a channel the server no
+    // longer has, and the restore's NAMES/TOPIC would go there too.
+    if (command === 'RENAME') {
+      // Not `from` — that is the sender, and this line's subject is a channel.
+      const oldName = params[0] || '';
+      const newName = params[1] || '';
+      if (!oldName || !newName) return false;
+      const key = oldName.toLowerCase();
+      if (!this.channels.has(key)) return false;
+      // The server form MUST carry the reason as a third parameter — an empty
+      // string when there is none, which still parses as a third parameter —
+      // so a two-parameter line is a server handing us its REASON as the new
+      // name. Checked here and nowhere else in this file because a bogus JOIN
+      // only adds a phantom to the set, while a bogus rename DROPS the channel
+      // we are actually in. A comma too: a channel name cannot hold one, and a
+      // server that answered with a list would take the real channel out.
+      if (params.length < 3 || /[\s,]/.test(newName)) return false;
+      this.channels.delete(key);
+      // A rename that only changes case renames the same key, so the delete
+      // above and this set are the same entry — it ends up spelled the new way.
+      this.channels.set(newName.toLowerCase(), newName);
       return true;
     }
     if (command === 'CHGHOST' && this.isSelf(from)) {
@@ -538,7 +594,13 @@ export class EngineUpstream extends EventEmitter {
   }
 
   replaySet(): string[] {
-    const out = [...this.burst];
+    // A burst line about a channel we are no longer in — parted, kicked, or
+    // renamed out from under us — is not replayed. The synthesised JOINs
+    // deliberately do not re-enter it, and a 353 or 332 naming it would put the
+    // fresh Client back in it regardless (irc-framework's userlist handler
+    // creates the channel), which is the restore then sending NAMES and TOPIC
+    // to a channel the server no longer has. (#889)
+    const out = this.burst.filter((b) => !b.chan || this.channels.has(b.chan)).map((b) => b.line);
     if (!this.nick) return out;
     const userhost = this.hostmask || FALLBACK_USERHOST;
     if (this.nickAtBurstEnd && this.nickAtBurstEnd !== this.nick) {
