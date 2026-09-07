@@ -144,6 +144,14 @@ export class EngineLink extends EventEmitter {
   // reason to keep the session: they are sent the moment the link is back,
   // before anyone gets to adopt those sockets.
   private readonly pendingCloses = new Set<string>();
+  // Ids this link has sent a `close` for. A `held` offer for one of them is
+  // stale by construction — the close is ahead of it on this link, and the
+  // engine reads a link in the order it was written — so it is not one more
+  // held session, whatever the engine believed when it wrote the offer.
+  // Cleared by a `connect` for the id (the app wants a session under it
+  // again) and at the next hello (a new link; its closes are its own, and a
+  // hello's list is read at face value).
+  private readonly closedHere = new Set<string>();
   private retryTimer: ReturnType<typeof setTimeout> | null = null;
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private lastFrameAt = 0;
@@ -187,11 +195,14 @@ export class EngineLink extends EventEmitter {
     return EngineLink.instance;
   }
 
-  // Tests build engines on ephemeral ports and need a fresh singleton each time.
-  static resetForTests(): void {
-    EngineLink.instance?.stop();
+  // Tests build engines on ephemeral ports and need a fresh singleton each
+  // time. Resolves once the old link's socket is closed (see stop()), so a
+  // teardown can wait for it rather than leave the handle to finish on its own.
+  static resetForTests(): Promise<void> {
+    const stopping = EngineLink.instance?.stop() ?? Promise.resolve();
     EngineLink.instance = null;
     disabledReason = null;
+    return stopping;
   }
 
   get address(): string {
@@ -269,6 +280,8 @@ export class EngineLink extends EventEmitter {
 
   send(frame: AppToEngine): boolean {
     if (this.state !== 'ready' || !this.socket || this.socket.destroyed) return false;
+    if (frame.op === 'close') this.closedHere.add(frame.id);
+    else if (frame.op === 'connect') this.closedHere.delete(frame.id);
     this.socket.write(encodeFrame(frame));
     return true;
   }
@@ -290,15 +303,44 @@ export class EngineLink extends EventEmitter {
     this.socket?.destroy();
   }
 
-  stop(): void {
+  // Stop for good. The link is half-closed, not destroyed: what was written
+  // just before this — at shutdown, every connection's `detach`, and any
+  // `close` a user's Disconnect became a moment earlier — must still get
+  // there. A destroy() closes the descriptor with those bytes possibly still
+  // queued (Nagle holds a small write until the previous one is acked, and
+  // that ack can be a delayed one), and when the engine has sent something we
+  // have not read yet the kernel answers the close with a RESET, which throws
+  // the queue away: the engine reads our earlier frames, then a reset, and the
+  // detach is gone — it still had the dead link's claim on the socket when the
+  // next process said hello (#894, Linux). A FIN pushes the queue first; the
+  // engine reads to EOF and ends its side, which closes ours. Resolves once the
+  // socket is closed, so a shutdown can wait for those bytes to leave before
+  // the process exits and the kernel closes the descriptor its own way.
+  stop(): Promise<void> {
     this.stopped = true;
     if (this.retryTimer) {
       clearTimeout(this.retryTimer);
       this.retryTimer = null;
     }
     this.stopHeartbeat();
-    this.socket?.destroy();
+    const socket = this.socket;
     this.socket = null;
+    // Nothing routes from here on, and nothing waits on a link that is not
+    // coming back: frames the engine writes before it reads our FIN would
+    // otherwise still reach reconcile in a process that has torn its
+    // connections down.
+    if (this.state !== 'refused') this.state = 'down';
+    if (!socket || socket.destroyed) return Promise.resolve();
+    socket.end();
+    return new Promise((resolve) => {
+      // A peer that never answers the FIN would keep the handle around — bound
+      // it.
+      const timer = setTimeout(() => socket.destroy(), 2000);
+      socket.once('close', () => {
+        clearTimeout(timer);
+        resolve();
+      });
+    });
   }
 
   private startHeartbeat(socket: net.Socket): void {
@@ -342,6 +384,10 @@ export class EngineLink extends EventEmitter {
     let sawHello = false;
     socket.setEncoding('utf8');
     socket.setKeepAlive(true, 10_000);
+    // Every frame is small and every one is a line on its way somewhere; Nagle
+    // would hold each behind the previous one's ack. (Also what made the last
+    // frame before a stop() droppable — see stop().)
+    socket.setNoDelay(true);
     socket.on('connect', () => {
       socket.write(
         encodeFrame({
@@ -354,6 +400,8 @@ export class EngineLink extends EventEmitter {
       );
     });
     socket.on('data', (chunk: string) => {
+      // A stopped link still reads to EOF; what arrives is not for us.
+      if (this.socket !== socket) return;
       this.lastFrameAt = Date.now();
       let frames: EngineToApp[];
       try {
@@ -369,6 +417,7 @@ export class EngineLink extends EventEmitter {
             sawHello = true;
             this.state = 'ready';
             this.heldSet.clear();
+            this.closedHere.clear();
             for (const id of frame.held) this.heldSet.add(id);
             this.engineVersion = frame.engine.version;
             // Older engines predate the field; absent means minor 1.
@@ -449,6 +498,16 @@ export class EngineLink extends EventEmitter {
       case 'detached':
         this.heldSet.delete(frame.id);
         break;
+      case 'held':
+        // A session the hello could not list, offered now that it is
+        // unclaimed (protocol.ts). Not a transport's frame: nothing here has
+        // claimed it — that is the point — so it goes to whoever reconciles.
+        // Unless this link already asked for it to be closed: that close is
+        // ahead of the offer on the wire, and the offer is stale.
+        if (this.closedHere.has(frame.id)) return;
+        this.heldSet.add(frame.id);
+        this.emit('held', frame.id);
+        return;
       default:
         break;
     }
@@ -503,6 +562,7 @@ export function startEngineLink(timeoutMs = 5000): Promise<LinkState> {
   });
 }
 
-export function stopEngineLink(): void {
-  EngineLink.shared().stop();
+// Resolves once the link's socket is closed (bounded; see EngineLink.stop).
+export function stopEngineLink(): Promise<void> {
+  return EngineLink.shared().stop();
 }

@@ -9,6 +9,10 @@
 // connection to the new link and tells the old one `detached`. That is what
 // lets a deploy start the new app before the old one has finished dying — and
 // it is not a socket event, so the old app must not treat it as one.
+//
+// A link learns what it may attach to twice over: the hello's `held` list, and
+// a `held` frame for each session that becomes unclaimed after that (the link
+// holding it died, or let go). See heldFor() and offer().
 
 import net from 'node:net';
 import { createHash, timingSafeEqual } from 'node:crypto';
@@ -22,7 +26,7 @@ import {
   PROTOCOL_MINOR,
   encodeFrame,
 } from './protocol.js';
-import type { AppToEngine, EngineToApp } from './protocol.js';
+import type { AppToEngine, ConnectionInfo, EngineToApp } from './protocol.js';
 import { isDialableCertPair } from '../utils/clientCert.js';
 
 export interface EngineServerOptions {
@@ -86,6 +90,9 @@ export class EngineServer {
   private readonly log: (line: string) => void;
   private readonly secretDigest: Buffer;
   private sweepTimer: ReturnType<typeof setInterval> | null = null;
+  // The link that last let go of a session on purpose (release), so that a
+  // registration completing after the detach is not offered back to it.
+  private readonly releasedBy = new WeakMap<EngineUpstream, AppLink>();
 
   constructor(private readonly opts: EngineServerOptions) {
     this.budget = new ByteBudget(opts.bufferTotalBytes);
@@ -145,20 +152,59 @@ export class EngineServer {
   // deliberately: a `connect` for it takes the claim over (contest) a backoff
   // later, whereas offering it would let reconcile re-adopt a session whose
   // user-issued close is still sitting in the dead link's unread bytes, and
-  // turn that Disconnect into a reconnect.
+  // turn that Disconnect into a reconnect. What the dead link claimed is
+  // offered when it is finally gone instead — offer(), which reads its unread
+  // bytes first by construction.
   private heldFor(link: AppLink): string[] {
     return [...this.upstreams.values()]
       .filter((u) => u.opts.instance === link.instance)
-      .filter((u) => u.state === 'open' && u.registered && !u.closing)
-      .filter((u) => !this.holderOf(u, link))
+      .filter((u) => this.isSession(u) && !this.holderOf(u, link))
       .map((u) => u.id);
   }
 
-  // The one other link holding `u`, if any. A claim is exclusive — every path
-  // that adds one strips the previous holder first — so there is at most one.
-  private holderOf(u: EngineUpstream, except: AppLink): AppLink | undefined {
+  // Something an app can attach to: open, registered, and not on its way out.
+  // Anything else in the map is not a session — a dial in progress, or a
+  // socket the previous app never finished registering — and advertising it
+  // would only make the app adopt something that ends in a fresh dial anyway.
+  private isSession(u: EngineUpstream): boolean {
+    return u.state === 'open' && u.registered && !u.closing;
+  }
+
+  // The link holding `u`, if any, other than `except`. A claim is exclusive —
+  // every path that adds one strips the previous holder first — so there is at
+  // most one.
+  private holderOf(u: EngineUpstream, except: AppLink | null): AppLink | undefined {
     for (const l of this.links) if (l !== except && l.claimed.has(u)) return l;
     return undefined;
+  }
+
+  // Sessions that have just become unclaimed — their link died, or detached
+  // them on purpose, or (a dial the dead link left behind) they finished
+  // registering with nobody attached — are offered to the instance's other
+  // links, whose hello may have come while the old link still held them; the
+  // hello's list is otherwise the last word, and a paused account's socket
+  // then stayed on IRC until the orphan reaper (#894).
+  //
+  // An offer can cross a `close` the receiving link has already sent for that
+  // very session: a user's Disconnect during a link blip is flushed the moment
+  // the link is back, and the poll batch that has the replacement's hello
+  // ready can have the dead socket's EOF ready beside it, in no particular
+  // order (#849). The app is the side that can tell. Frames on a link are read
+  // in the order they were written, so a `held` that arrives after the app's
+  // own `close` for the id went out is stale by construction, and
+  // engineLink.ts drops it. (A fence here — ping, offer on the pong — covers
+  // less: a close sent after the pong and before the offer lands is the same
+  // race one round trip later.)
+  private offer(released: EngineUpstream[], except: AppLink | null): void {
+    for (const u of released) {
+      if (!this.isSession(u) || this.holderOf(u, null)) continue;
+      for (const link of this.links) {
+        if (link === except || !link.authed || link.socket.destroyed) continue;
+        if (link.instance !== u.opts.instance) continue;
+        link.send({ op: 'held', id: u.id });
+        this.log(`${u.id}: offered to ${link.peer}`);
+      }
+    }
   }
 
   // Newest wins — the one rule for an attach and for a close. Another link
@@ -199,14 +245,9 @@ export class EngineServer {
     return null;
   }
 
-  // The sessions an app can attach to: open, registered, and not on their way
-  // out. Anything else in the map is not a session — a dial in progress, or a
-  // socket the previous app never finished registering — and advertising it
-  // would only make the app adopt something that ends in a fresh dial anyway.
+  // Every session, whoever claims it.
   held(): string[] {
-    return [...this.upstreams.values()]
-      .filter((u) => u.state === 'open' && u.registered && !u.closing)
-      .map((u) => u.id);
+    return [...this.upstreams.values()].filter((u) => this.isSession(u)).map((u) => u.id);
   }
 
   connectionCount(): number {
@@ -216,6 +257,11 @@ export class EngineServer {
   // Whether the engine still has a socket (in any state) under this id.
   hasConnection(id: string): boolean {
     return this.upstreams.has(id);
+  }
+
+  // One session's listing entry — what `list` would say about it.
+  info(id: string): ConnectionInfo | undefined {
+    return this.upstreams.get(id)?.info();
   }
 
   // Stop accepting, drop every link, and — because the engine going away IS
@@ -255,6 +301,9 @@ export class EngineServer {
     // Detect a dead peer host (the app can be on another box) rather than hold
     // its connections "attached" to a link that will never ack again.
     socket.setKeepAlive(true, 10_000);
+    // Every frame is small and every one is a line on its way to a person;
+    // Nagle would hold each behind the previous one's ack.
+    socket.setNoDelay(true);
     socket.on('data', (chunk: string) => this.onData(link, chunk));
     socket.on('drain', () => {
       for (const u of link.claimed) u.resume();
@@ -542,6 +591,12 @@ export class EngineServer {
       this.log(`${id}: open ${local.address}:${local.port} -> ${remote.address}:${remote.port}`);
     });
     const created = u;
+    // Registered with nobody attached: the link that dialed it is gone, or let
+    // go mid-registration — and a successor's hello sent meanwhile could not
+    // list a socket that was not a session yet.
+    u.on('registered', (unattended: boolean) => {
+      if (unattended) this.offer([created], this.releasedBy.get(created) ?? null);
+    });
     u.on('closed', (error?: string) => {
       this.log(`${id}: closed${error ? ` (${error})` : ''}`);
       // Only if the id still means this socket — a fresh dial may have taken
@@ -568,14 +623,18 @@ export class EngineServer {
     if (!link.claimed.delete(u)) return;
     u.detach();
     this.log(`${u.id}: detached by ${link.peer} (pending ${u.buffer.length})`);
+    this.releasedBy.set(u, link);
+    this.offer([u], link);
   }
 
   private onLinkClose(link: AppLink): void {
     if (!this.links.delete(link)) return;
-    for (const u of link.claimed) {
+    const released = [...link.claimed];
+    for (const u of released) {
       u.detach();
       this.log(`${u.id}: link ${link.peer} lost — holding (pending ${u.buffer.length})`);
     }
     link.claimed.clear();
+    this.offer(released, null);
   }
 }

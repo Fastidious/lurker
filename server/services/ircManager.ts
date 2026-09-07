@@ -144,7 +144,10 @@ function engineHolds(userId: number, networkId: number): boolean {
 
 class IrcManager extends EventEmitter {
   byUser: Map<number, Map<number, IrcConnection>>;
-  private engineReconcileHooked = false;
+  // The link whose 'ready' and 'held' events reconcile listens on — held so a
+  // link replaced under us (tests rebuild the singleton) is hooked afresh
+  // rather than left to the listeners on its predecessor.
+  private reconcileHookedLink: EngineLink | null = null;
 
   constructor() {
     super();
@@ -205,11 +208,15 @@ class IrcManager extends EventEmitter {
     for (const id of userIds) this.initForUser(id);
     if (engineConfigured()) {
       this.reconcileEngine();
-      // Again whenever the link (re)connects: an engine that answered after the
-      // boot-time wait, or came back from an outage, reports a fresh held list.
-      if (!this.engineReconcileHooked) {
-        this.engineReconcileHooked = true;
-        EngineLink.shared().on('ready', () => this.reconcileEngine());
+      // Again whenever the link (re)connects — an engine that answered after
+      // the boot-time wait, or came back from an outage, reports a fresh held
+      // list — and whenever the engine offers a session after that: one whose
+      // previous link was still on the books at hello and has since let go.
+      const link = EngineLink.shared();
+      if (this.reconcileHookedLink !== link) {
+        this.reconcileHookedLink = link;
+        link.on('ready', () => this.reconcileEngine());
+        link.on('held', (id: string) => this.reconcileHeld(link, id));
       }
     }
   }
@@ -223,39 +230,42 @@ class IrcManager extends EventEmitter {
   reconcileEngine(): void {
     const link = EngineLink.shared();
     if (link.state !== 'ready') return;
-    for (const id of link.held) {
-      // The engine only offers us our own instance's sessions, but this is
-      // where a foreign id would do its damage — parsed into someone else's
-      // rowids and adopted as ours — so check the prefix here too rather than
-      // trusting the other side to have filtered.
-      if (!isOurConnectionId(id)) {
-        console.warn(`[lurker] engine offered ${id}, which is not this instance's — ignoring`);
-        continue;
-      }
-      const m = /^[0-9a-f]+:(\d+):(\d+)$/.exec(id);
-      if (!m) continue;
-      const userId = Number(m[1]);
-      const networkId = Number(m[2]);
-      if (this.getConnection(userId, networkId)) continue;
-      const gate = this.connectGate(userId, networkId);
-      if (gate.ok) {
-        systemLog.log({
-          userId,
-          scope: `net:${gate.network.name}`,
-          fields: { networkId },
-          text: 'Adopting the connection the engine kept open',
-        });
-        this.startNetwork(userId, networkId);
-      } else {
-        console.warn(`[lurker] engine holds ${id} but ${gate.reason} — closing it`);
-        // requestClose, not a bare send: the link can drop between the check at
-        // the top of this loop and here, and a policy close that silently
-        // evaporates leaves a paused account on IRC. The queue is also what
-        // makes this decision stick — EngineLink flushes pending closes before
-        // it emits 'ready', i.e. before anything can decide those sockets are
-        // worth adopting.
-        link.requestClose(id);
-      }
+    for (const id of link.held) this.reconcileHeld(link, id);
+  }
+
+  // One held session: adopt it, close it, or leave it to the connection that
+  // already speaks for it.
+  private reconcileHeld(link: EngineLink, id: string): void {
+    // The engine only offers us our own instance's sessions, but this is
+    // where a foreign id would do its damage — parsed into someone else's
+    // rowids and adopted as ours — so check the prefix here too rather than
+    // trusting the other side to have filtered.
+    if (!isOurConnectionId(id)) {
+      console.warn(`[lurker] engine offered ${id}, which is not this instance's — ignoring`);
+      return;
+    }
+    const m = /^[0-9a-f]+:(\d+):(\d+)$/.exec(id);
+    if (!m) return;
+    const userId = Number(m[1]);
+    const networkId = Number(m[2]);
+    if (this.getConnection(userId, networkId)) return;
+    const gate = this.connectGate(userId, networkId);
+    if (gate.ok) {
+      systemLog.log({
+        userId,
+        scope: `net:${gate.network.name}`,
+        fields: { networkId },
+        text: 'Adopting the connection the engine kept open',
+      });
+      this.startNetwork(userId, networkId);
+    } else {
+      console.warn(`[lurker] engine holds ${id} but ${gate.reason} — closing it`);
+      // requestClose, not a bare send: the link can drop between the check
+      // above and here, and a policy close that silently evaporates leaves a
+      // paused account on IRC. The queue is also what makes this decision
+      // stick — EngineLink flushes pending closes before it emits 'ready',
+      // i.e. before anything can decide those sockets are worth adopting.
+      link.requestClose(id);
     }
   }
 

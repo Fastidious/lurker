@@ -143,6 +143,38 @@ describe('POST /api/networks', () => {
     expect(fakeManager.calls.some(([m]) => m === 'startNetwork')).toBe(true);
   });
 
+  // The body goes to createNetwork unvalidated, and a client that sends a
+  // number is taken at its word: 0 is off (it read as on until #894 found
+  // it), and a null is "unset", which is the default — on.
+  it('stores a numeric 0 as off and a null as the default', async () => {
+    const off = await makeNet(aliceAgent, { autoconnect: 0, name: 'num-off' });
+    expect(off.status).toBe(201);
+    expect(off.body.network.autoconnect).toBe(false);
+    const unset = await makeNet(aliceAgent, { autoconnect: null, name: 'null-unset' });
+    expect(unset.status).toBe(201);
+    expect(unset.body.network.autoconnect).toBe(true);
+  });
+
+  // The same null on an update means "unchanged", for all three flags: the
+  // old coercion read it as false, which for `tls` turned "leave it" into
+  // "drop the encryption".
+  it('a null flag on PATCH leaves that flag alone', async () => {
+    const net = await makeNet(aliceAgent, { autoconnect: false, tls: true, name: 'null-patch' });
+    expect(net.status).toBe(201);
+    const id = net.body.network.id;
+    const nulls = await aliceAgent
+      .patch(`/api/networks/${id}`)
+      .send({ autoconnect: null, tls: null, trusted_certificates: null, nick: 'renamed' });
+    expect(nulls.status).toBe(200);
+    expect(nulls.body.network.autoconnect).toBe(false);
+    expect(nulls.body.network.tls).toBe(true);
+    expect(nulls.body.network.nick).toBe('renamed');
+    const on = await aliceAgent.patch(`/api/networks/${id}`).send({ autoconnect: true });
+    expect(on.body.network.autoconnect).toBe(true);
+    const off = await aliceAgent.patch(`/api/networks/${id}`).send({ autoconnect: 0 });
+    expect(off.body.network.autoconnect).toBe(false);
+  });
+
   it('500s and does not connect if createNetwork returns undefined', async () => {
     const networksDb = await import('../db/networks.js');
     const spy = vi.spyOn(networksDb, 'createNetwork').mockReturnValueOnce(undefined);

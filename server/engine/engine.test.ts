@@ -1195,6 +1195,96 @@ describe('third review round', () => {
   });
 });
 
+// The hello's `held` list withholds what another link still claims — a dead
+// link's included, since the engine may read a replacement's hello before the
+// corpse's EOF (#849) — and until #894 nothing ever re-listed those. An offer
+// can cross a `close` the link already sent; that is the app's to drop
+// (engineLink.test.ts), so nothing here waits for anything.
+describe('a session released after hello is offered (#894)', () => {
+  it('offers the session a dead link still claimed at hello, once that link is gone', async () => {
+    const id = `late:${++counter}`;
+    const nick = `late${counter}`;
+    const a = await link();
+    await register(a, id, nick);
+    const b = await link();
+    // Strict at hello, as before: a is still on the books.
+    expect(b.hello?.held).not.toContain(id);
+    a.kill();
+    expect(await b.waitFor((f) => f.op === 'held')).toMatchObject({ op: 'held', id });
+    // And it is adoptable: the connect attaches, it does not dial.
+    b.send(connectFrame(id));
+    const att = await b.waitFor<Attached>((f) => f.op === 'attached' && f.id === id);
+    expect(att.nick).toBe(nick);
+    expect(ircd.registrations.filter((r) => r.nick === nick)).toHaveLength(1);
+  });
+
+  it('offers what a link let go of to the others, not back to it', async () => {
+    const id = `letgo:${++counter}`;
+    const a = await link();
+    await register(a, id, `letgo${counter}`);
+    const b = await link();
+    expect(b.hello?.held).not.toContain(id);
+    a.send({ op: 'detach', id });
+    expect(await b.waitFor((f) => f.op === 'held')).toMatchObject({ id });
+    await new Promise((r) => setTimeout(r, 30));
+    expect(a.frames.some((f) => f.op === 'held')).toBe(false);
+  });
+
+  it('offers a session that finished registering after its link died', async () => {
+    // A dial the dead link left behind: at b's hello it is not a session yet,
+    // so the hello cannot list it, and the release at a's death has nothing
+    // to offer either. Registration completing is the moment it becomes one.
+    const id = `late-reg:${++counter}`;
+    const nick = `latereg${counter}`;
+    const a = await link();
+    a.send(connectFrame(id));
+    await a.waitFor((f) => f.op === 'open' && f.id === id);
+    const b = await link();
+    expect(b.hello?.held).not.toContain(id);
+    a.send({ op: 'write', id, line: `NICK ${nick}` });
+    a.send({ op: 'write', id, line: `USER ${nick} 0 * :u` });
+    a.kill();
+    await b.waitFor((f) => f.op === 'held' && f.id === id);
+    b.send(connectFrame(id));
+    const att = await b.waitFor<Attached>((f) => f.op === 'attached' && f.id === id);
+    expect(att.unattended).toBe(true);
+  });
+
+  it('does not offer a registration back to the link that let go of it mid-way', async () => {
+    // A detach is allowed from `open`, before 001 — and the link that sent it
+    // is still here. What registers afterwards is offered to the others only.
+    const id = `letgo-early:${++counter}`;
+    const nick = `letgoearly${counter}`;
+    const a = await link();
+    a.send(connectFrame(id));
+    await a.waitFor((f) => f.op === 'open' && f.id === id);
+    const b = await link();
+    expect(b.hello?.held).not.toContain(id);
+    a.send({ op: 'write', id, line: `NICK ${nick}` });
+    a.send({ op: 'write', id, line: `USER ${nick} 0 * :u` });
+    a.send({ op: 'detach', id });
+    await b.waitFor((f) => f.op === 'held' && f.id === id);
+    await new Promise((r) => setTimeout(r, 30));
+    expect(a.frames.some((f) => f.op === 'held')).toBe(false);
+    b.send(connectFrame(id));
+    const att = await b.waitFor<Attached>((f) => f.op === 'attached' && f.id === id);
+    expect(att.unattended).toBe(true);
+  });
+
+  it("offers only to links of the session's instance", async () => {
+    const id = `mine:${++counter}`;
+    const a = await link();
+    await register(a, id, `mine${counter}`);
+    const stranger = await TestLink.connect(enginePort, SECRET, { instance: 'some-other-db' });
+    links.push(stranger);
+    const b = await link();
+    a.kill();
+    await b.waitFor((f) => f.op === 'held' && f.id === id);
+    await new Promise((r) => setTimeout(r, 30));
+    expect(stranger.frames.some((f) => f.op === 'held')).toBe(false);
+  });
+});
+
 describe('orphan reaper', () => {
   it('ends a session no link has claimed for orphanMs', async () => {
     const own = new EngineServer({

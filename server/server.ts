@@ -284,8 +284,11 @@ function shutdown(signal: string): void {
   stopIgnoreSweeper();
   stopEventLoopMonitor();
   ircManager.shutdown();
-  stopEngineLink();
-  server.close(() => process.exit(0));
+  // The detaches just written must leave before this process's descriptors
+  // are closed out from under them: server.close with no client connected
+  // calls back on the next tick, and an exit before the loop turns closes the
+  // link with a reset, unsent bytes and all (engineLink.ts stop()).
+  void stopEngineLink().then(() => server.close(() => process.exit(0)));
   setTimeout(() => process.exit(1), 5000).unref();
 }
 process.on('SIGINT', () => shutdown('SIGINT'));
