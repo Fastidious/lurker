@@ -142,7 +142,8 @@ export function createNetwork(userId: number, fields: NetworkFields): Network | 
       encryptSecret(server_password || null),
       // Default on when absent or null; otherwise by truthiness, like
       // trusted_certificates above — the option admits a number, and `0` must
-      // mean off (it read as on).
+      // mean off (it read as on). A null is "unset" on an update too: there it
+      // leaves the column alone (updateNetwork).
       autoconnect === undefined || autoconnect === null ? 1 : autoconnect ? 1 : 0,
       encryptSecret(sasl_account || null),
       encryptSecret(sasl_password || null),
@@ -180,13 +181,17 @@ export function updateNetwork(
   const params: unknown[] = [];
   for (const key of allowed) {
     if (key in fields) {
-      setClauses.push(`${key} = ?`);
       let value: unknown = fields[key];
-      if (key === 'tls' || key === 'autoconnect' || key === 'trusted_certificates')
+      if (key === 'tls' || key === 'autoconnect' || key === 'trusted_certificates') {
+        // A null is "unset", as on create — and on an update, unset means
+        // unchanged. Coercing it would switch the flag OFF, which for `tls` is
+        // a client meaning "leave it" silently dropping the encryption.
+        if (value === null || value === undefined) continue;
         value = value ? 1 : 0;
-      else if (ENCRYPTED_NETWORK_COLUMNS.includes(key)) {
+      } else if (ENCRYPTED_NETWORK_COLUMNS.includes(key)) {
         value = encryptSecret(value as string | null);
       }
+      setClauses.push(`${key} = ?`);
       params.push(value);
     }
   }
