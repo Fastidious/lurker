@@ -98,7 +98,7 @@ export async function startEngineHarness(opts: {
     until: (pred, ms, what) => until(pred, ms, what, wireTail),
     async stop() {
       ircManager.shutdown();
-      EngineLink.resetForTests();
+      await EngineLink.resetForTests();
       await engine.shutdown('tests done', 500);
       await ircd.close();
       restoreEnv();

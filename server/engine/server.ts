@@ -26,7 +26,7 @@ import {
   PROTOCOL_MINOR,
   encodeFrame,
 } from './protocol.js';
-import type { AppToEngine, EngineToApp } from './protocol.js';
+import type { AppToEngine, ConnectionInfo, EngineToApp } from './protocol.js';
 import { isDialableCertPair } from '../utils/clientCert.js';
 
 export interface EngineServerOptions {
@@ -257,6 +257,11 @@ export class EngineServer {
   // Whether the engine still has a socket (in any state) under this id.
   hasConnection(id: string): boolean {
     return this.upstreams.has(id);
+  }
+
+  // One session's listing entry — what `list` would say about it.
+  info(id: string): ConnectionInfo | undefined {
+    return this.upstreams.get(id)?.info();
   }
 
   // Stop accepting, drop every link, and — because the engine going away IS

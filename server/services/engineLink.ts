@@ -195,11 +195,14 @@ export class EngineLink extends EventEmitter {
     return EngineLink.instance;
   }
 
-  // Tests build engines on ephemeral ports and need a fresh singleton each time.
-  static resetForTests(): void {
-    EngineLink.instance?.stop();
+  // Tests build engines on ephemeral ports and need a fresh singleton each
+  // time. Resolves once the old link's socket is closed (see stop()), so a
+  // teardown can wait for it rather than leave the handle to finish on its own.
+  static resetForTests(): Promise<void> {
+    const stopping = EngineLink.instance?.stop() ?? Promise.resolve();
     EngineLink.instance = null;
     disabledReason = null;
+    return stopping;
   }
 
   get address(): string {

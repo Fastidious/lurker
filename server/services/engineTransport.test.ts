@@ -50,7 +50,7 @@ afterAll(async () => {
   await ircd.close();
 });
 
-afterEach(() => {
+afterEach(async () => {
   for (const c of clients.splice(0)) {
     try {
       c.connection.end();
@@ -58,7 +58,7 @@ afterEach(() => {
       /* already gone */
     }
   }
-  for (const l of links.splice(0)) l.stop();
+  await Promise.all(links.splice(0).map((l) => l.stop()));
 });
 
 function newLink(secret = SECRET, port = enginePort): EngineLink {
@@ -195,10 +195,22 @@ describe('EngineTransport', () => {
     expect(a.t.events.at(-1)).toBe(`socket close:${ENGINE_CLOSE.LINK_LOST}`);
     linkA.stop();
 
+    // What happens while nobody is attached — and it has to have REACHED the
+    // engine before B attaches, or it is live traffic rather than backlog: a
+    // server's socket is free to hold small writes back behind an unacked one
+    // (Nagle), and a link that does not (setNoDelay) attaches well inside
+    // that window on Linux.
+    const buffered = () => engine.info(id)?.bufferedLines ?? 0;
+    const bufferedBefore = buffered();
     ircd.say('peer', '#two', 'while away 1');
     ircd.say('peer', 'moved', 'dm while away');
     ircd.setTopic('peer', '#two', 'set while away');
     ircd.say('peer', '#two', 'while away 2');
+    await until(
+      () => buffered() >= bufferedBefore + 4,
+      'the engine buffered the four lines',
+      () => [`buffered ${buffered()} (was ${bufferedBefore})`],
+    );
 
     // Process B: a fresh Client, configured with the STALE nick.
     const linkB = newLink();

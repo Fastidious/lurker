@@ -162,11 +162,17 @@ describe('IrcConnection through the engine', () => {
   }, 30000);
 
   it('a new IrcConnection re-attaches with no new history and no re-registration', async () => {
-    // Life while the app is away.
+    // Life while the app is away — and it has to have REACHED the engine
+    // before the app re-attaches, or it is live traffic rather than backlog.
+    // A server's socket is free to hold small writes back behind an unacked
+    // one (Nagle, ~40 ms on Linux), and a link with no such delay attaches
+    // well inside that window; a fixed sleep here was a coin toss.
+    const buffered = () => engine.info(engineId)?.bufferedLines ?? 0;
+    const bufferedBefore = buffered();
     ircd.kick('#gone', 'lurk');
     ircd.say('peer', '#stay', 'while away');
     ircd.say('peer', 'lurk', 'dm while away');
-    await new Promise((r) => setTimeout(r, 30));
+    await until(() => buffered() >= bufferedBefore + 3, 5000, 'the engine buffered the gap');
     managerEvents.length = 0;
 
     // Through ircManager this time, so the autojoin listener is on.
